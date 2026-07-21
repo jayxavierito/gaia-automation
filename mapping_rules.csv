@@ -1,0 +1,3 @@
+priority,item_pattern,spec_pattern,gaia_item_name,gaia_code,condition_append,notes
+100,^表層\(車道・路肩部\)$,,表層(車道･路肩部),CB410260,,既存のGaia取込実績で確認済みの施工パッケージコード
+100,^上層路盤\(車道・路肩部\)$,,上層路盤(車道･路肩部),CB410040,,既存のGaia取込実績で確認済みの施工パッケージコード
