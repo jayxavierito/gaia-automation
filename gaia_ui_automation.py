@@ -184,6 +184,15 @@ def fill_native_gaia_file_dialog(candidate: Path) -> bool:
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.SetWindowTextW.restype = wintypes.BOOL
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = wintypes.LPARAM
     windows: list[int] = []
     enum_windows_proc = ctypes.WINFUNCTYPE(
         ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
@@ -230,7 +239,8 @@ def fill_native_gaia_file_dialog(candidate: Path) -> bool:
     if not filename_edits or not open_buttons:
         return False
 
-    user32.SendMessageW(filename_edits[0], 0x000C, 0, str(candidate.resolve()))
+    if not user32.SetWindowTextW(filename_edits[0], str(candidate.resolve())):
+        return False
     user32.SendMessageW(open_buttons[0], 0x00F5, 0, 0)
     return True
 
