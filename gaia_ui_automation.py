@@ -178,14 +178,73 @@ def attach_or_launch(Application, Desktop, executable: Path, timeout: int):
     )
 
 
+def fill_native_gaia_file_dialog(candidate: Path) -> bool:
+    """Fill GAIA's classic Win32 file dialog without UIA control discovery."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    windows: list[int] = []
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
+    )
+
+    @enum_windows_proc
+    def collect_window(hwnd, _):
+        length = user32.GetWindowTextLengthW(hwnd)
+        title_buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title_buffer, length + 1)
+        class_buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+        if (
+            class_buffer.value == "#32770"
+            and "設計書ファイル" in title_buffer.value
+            and user32.IsWindowVisible(hwnd)
+        ):
+            windows.append(hwnd)
+        return True
+
+    user32.EnumWindows(collect_window, 0)
+    if not windows:
+        return False
+
+    dialog = windows[0]
+    filename_edits: list[int] = []
+    open_buttons: list[int] = []
+    enum_children_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
+    )
+
+    @enum_children_proc
+    def collect_child(hwnd, _):
+        class_buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+        control_id = user32.GetDlgCtrlID(hwnd)
+        if control_id == 1148 and class_buffer.value == "Edit":
+            filename_edits.append(hwnd)
+        elif control_id == 1 and class_buffer.value == "Button":
+            open_buttons.append(hwnd)
+        return True
+
+    user32.EnumChildWindows(dialog, collect_child, 0)
+    if not filename_edits or not open_buttons:
+        return False
+
+    user32.SendMessageW(filename_edits[0], 0x000C, 0, str(candidate.resolve()))
+    user32.SendMessageW(open_buttons[0], 0x00F5, 0, 0)
+    return True
+
+
 def handle_open_dialog(Desktop, candidate: Path, timeout: int) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if fill_native_gaia_file_dialog(candidate):
+            return
         for backend in ("uia", "win32"):
             for window in Desktop(backend=backend).windows():
                 try:
                     title = window.window_text()
-                    if "開く" not in title:
+                    if "開く" not in title and "設計書ファイル" not in title:
                         continue
                     edits = window.descendants(control_type="Edit")
                     if not edits:
