@@ -364,9 +364,18 @@ def run_trial(config: TrialConfig) -> dict:
         raise LookupError(f"試験用フォルダーが見つかりません: {config.folder_name}")
     click_control(project_window, "設計書取込")
 
-    import_window = wait_for_window(Desktop, "参照", config.timeout_seconds)
-    click_control(import_window, "参照")
-    handle_open_dialog(Desktop, config.candidate, config.timeout_seconds)
+    try:
+        # GAIA 11.1 normally opens the Win32 file picker immediately.
+        handle_open_dialog(Desktop, config.candidate, min(15, config.timeout_seconds))
+    except TimeoutError:
+        # Some installations show an intermediate source-selection form.
+        source_window = wait_for_window(
+            Desktop, "参照", config.timeout_seconds
+        )
+        click_control(source_window, "参照")
+        handle_open_dialog(Desktop, config.candidate, config.timeout_seconds)
+
+    import_window = wait_for_window(Desktop, "金抜き", config.timeout_seconds)
     time.sleep(2)
     capture(import_window, config.output_dir, "02_import_recognition.png")
     texts = control_texts(import_window)
