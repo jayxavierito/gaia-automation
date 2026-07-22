@@ -9,6 +9,7 @@ param(
     [string] $District = "",
     [string] $Location = "",
     [string] $WorkCategory = "",
+    [string] $ExtractionWorkDirectory = ".\tmp\quantity-extraction",
     [string] $Output = ".\outputs\GAIA_candidate.xlsx"
 )
 
@@ -41,6 +42,7 @@ $converterArgs = @(
     "--reference-index", $ReferenceIndex,
     "--tree-category", $TreeCategory,
     "--output", $Output,
+    "--extraction-work-dir", $ExtractionWorkDirectory,
     "--price-date", $PriceDate
 )
 

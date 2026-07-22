@@ -6,3 +6,6 @@
 /references/*.json
 /tmp/
 /.pytest_cache/
+/build/
+/dist/
+/*.spec

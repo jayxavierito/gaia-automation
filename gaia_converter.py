@@ -15,9 +15,9 @@ from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.worksheet import Worksheet
 
+from quantity_extractors import extract_quantity_source
 
-SUMMARY_SHEET_RE = re.compile(r"^設計数量総括表[（(](.+?)[）)]$")
-HEADER_NAMES = {"工種", "種別", "細別", "規格", "単位", "数量"}
+
 BLANK_VALUES = {"", "-", "―"}
 SOURCE_YEAR_RE = re.compile(r"(?:令和|R)\s*(\d+)", re.IGNORECASE)
 GAIA_CODE_RE = re.compile(r"^\[([A-Z]{2}\d{6})\]$")
@@ -62,6 +62,12 @@ class BoqItem:
     setting: str
     notes: str
     source_reference: str
+    source_format: str = "excel"
+    extractor: str = ""
+    source_page: int | None = None
+    extraction_status: str = "READY"
+    extraction_confidence: float = 1.0
+    extraction_warnings: list[str] = field(default_factory=list)
     gaia_item_name: str = ""
     gaia_code: str = ""
     gaia_condition: str = ""
@@ -97,12 +103,6 @@ def clean_text(value: object) -> str:
         return ""
     text = unicodedata.normalize("NFKC", str(value))
     return re.sub(r"\s+", " ", text).strip()
-
-
-def clean_label(value: object) -> str:
-    text = clean_text(value)
-    japanese = r"一-龯々ぁ-ゖァ-ヺー"
-    return re.sub(rf"(?<=[{japanese}])\s+(?=[{japanese}])", "", text)
 
 
 def normalize_match_text(value: object) -> str:
@@ -159,22 +159,6 @@ def append_warning(item: BoqItem, message: str) -> None:
         item.warnings.append(cleaned)
 
 
-def parse_quantity(value: object) -> float | int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    else:
-        text = clean_text(value).replace(",", "")
-        match = re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text)
-        if not match:
-            return None
-        number = float(text)
-    if number.is_integer():
-        return int(number)
-    return number
-
-
 def combine_unique(*values: str) -> str:
     result: list[str] = []
     seen: set[str] = set()
@@ -187,94 +171,43 @@ def combine_unique(*values: str) -> str:
     return " / ".join(result)
 
 
-def extract_project_name(workbook) -> str:
-    for sheet in workbook.worksheets:
-        if not SUMMARY_SHEET_RE.match(sheet.title):
-            continue
-        for row in range(1, min(sheet.max_row, 10) + 1):
-            value = clean_text(sheet.cell(row, 1).value)
-            if value.startswith("設計書名:"):
-                return value.split(":", 1)[1].strip()
-    return "数量計算書変換工事"
-
-
-def is_header_or_title(value: str) -> bool:
-    normalized = clean_text(value).replace(" ", "")
-    return (
-        not normalized
-        or normalized in HEADER_NAMES
-        or normalized.startswith("設計数量総括表")
-        or normalized.startswith("設計書名:")
-    )
-
-
-def find_quantity_row(sheet: Worksheet, item_row: int) -> tuple[float | int | None, int]:
-    direct = parse_quantity(sheet.cell(item_row, 6).value)
-    if direct is not None:
-        return direct, item_row
-
-    for row in range(item_row + 1, min(item_row + 4, sheet.max_row) + 1):
-        if clean_text(sheet.cell(row, 3).value) or clean_text(sheet.cell(row, 5).value):
-            break
-        quantity = parse_quantity(sheet.cell(row, 6).value)
-        if quantity is not None:
-            return quantity, row
-    return None, item_row
-
-
-def extract_boq_items(source_path: Path) -> tuple[str, list[BoqItem]]:
-    workbook = load_workbook(source_path, data_only=True, read_only=False)
-    project_name = extract_project_name(workbook)
+def extract_boq_items(
+    source_path: Path, work_dir: Path | None = None
+) -> tuple[str, list[BoqItem]]:
+    extraction = extract_quantity_source(source_path, work_dir=work_dir)
     items: list[BoqItem] = []
-
-    for sheet in workbook.worksheets:
-        match = SUMMARY_SHEET_RE.match(sheet.title)
-        if not match:
-            continue
-
-        section = clean_text(match.group(1))
-        current_work_type = ""
-        current_category = ""
-
-        for row in range(1, sheet.max_row + 1):
-            col_a = clean_label(sheet.cell(row, 1).value)
-            col_b = clean_label(sheet.cell(row, 2).value)
-            col_c = clean_label(sheet.cell(row, 3).value)
-            unit = clean_text(sheet.cell(row, 5).value)
-
-            if col_a and not is_header_or_title(col_a):
-                current_work_type = col_a
-                current_category = ""
-            if col_b and not is_header_or_title(col_b):
-                current_category = col_b
-
-            if not col_c or is_header_or_title(col_c) or not unit:
-                continue
-
-            quantity, quantity_row = find_quantity_row(sheet, row)
-            item = BoqItem(
-                source_sheet=sheet.title,
-                source_row=row,
-                section=section,
-                work_type=current_work_type,
-                category=current_category,
-                item_name=col_c,
-                specification=clean_text(sheet.cell(row, 4).value),
-                unit=unit,
-                quantity=quantity,
-                remarks=clean_text(sheet.cell(row, 7).value),
-                standard=clean_text(sheet.cell(row, 8).value),
-                daily_output=clean_text(sheet.cell(row, 9).value),
-                setting=clean_text(sheet.cell(row, 10).value),
-                notes=clean_text(sheet.cell(row, 11).value),
-                source_reference=clean_text(sheet.cell(quantity_row, 8).value),
-            )
-            item.gaia_item_name = item.item_name
-            item.gaia_condition = combine_unique(item.specification, item.setting, item.remarks)
-            items.append(item)
-
-    workbook.close()
-    return project_name, items
+    for record in extraction.records:
+        item = BoqItem(
+            source_sheet=record.source_sheet,
+            source_row=record.source_row,
+            section=record.section,
+            work_type=record.work_type,
+            category=record.category,
+            item_name=record.item_name,
+            specification=record.specification,
+            unit=record.unit,
+            quantity=record.quantity,
+            remarks=record.remarks,
+            standard=record.standard,
+            daily_output=record.daily_output,
+            setting=record.setting,
+            notes=record.notes,
+            source_reference=record.source_reference,
+            source_format=record.source_format,
+            extractor=record.extractor,
+            source_page=record.source_page,
+            extraction_status=record.extraction_status,
+            extraction_confidence=record.extraction_confidence,
+            extraction_warnings=list(record.extraction_warnings),
+        )
+        item.gaia_item_name = item.item_name
+        item.gaia_condition = combine_unique(
+            item.specification, item.setting, item.remarks
+        )
+        for warning in item.extraction_warnings:
+            append_warning(item, warning)
+        items.append(item)
+    return extraction.project_name, items
 
 
 def load_mapping_rules(path: Path | None) -> list[MappingRule]:
@@ -720,6 +653,10 @@ def classify_item(item: BoqItem, *, reference_index_active: bool = False) -> Non
         item.match_status = "INVALID_QUANTITY"
         item.confidence = 0.0
         append_warning(item, "数量を取得できない、または数量が0以下です")
+    elif item.extraction_status != "READY":
+        item.match_status = "SOURCE_REVIEW_REQUIRED"
+        item.confidence = min(0.5, item.extraction_confidence)
+        append_warning(item, "原本照合が完了するまで自動確定しません")
     elif "適用不可" in searchable:
         item.match_status = "BLOCKED_REVIEW"
         item.confidence = 0.0
@@ -948,8 +885,14 @@ def build_gaia_candidate(
 def write_review_csv(path: Path, items: list[BoqItem]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "source_format",
+        "extractor",
         "source_sheet",
+        "source_page",
         "source_row",
+        "extraction_status",
+        "extraction_confidence",
+        "extraction_warnings",
         "section",
         "work_type",
         "category",
@@ -997,6 +940,7 @@ def write_review_csv(path: Path, items: list[BoqItem]) -> None:
         writer.writeheader()
         for item in items:
             row = asdict(item)
+            row["extraction_warnings"] = "; ".join(item.extraction_warnings)
             row["warnings"] = "; ".join(item.warnings)
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
@@ -1010,6 +954,11 @@ def main() -> int:
         description="数量計算書の設計数量総括表をGaia取込候補へ変換します。"
     )
     parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument(
+        "--extraction-work-dir",
+        type=Path,
+        help="PDFページとOCRセルを診断用に保存するディレクトリ。",
+    )
     parser.add_argument("--template", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--review", type=Path)
@@ -1037,7 +986,9 @@ def main() -> int:
     parser.add_argument("--price-date", default="", help="YYYY-MM-DD")
     args = parser.parse_args()
 
-    project_name, items = extract_boq_items(args.source)
+    project_name, items = extract_boq_items(
+        args.source, work_dir=args.extraction_work_dir
+    )
     if args.project_name:
         project_name = clean_text(args.project_name)
     price_date = parse_iso_date(args.price_date)
@@ -1086,6 +1037,10 @@ def main() -> int:
     result = {
         "project_name": project_name,
         "source_items": len(items),
+        "source_format": items[0].source_format if items else "",
+        "extraction_review_required": sum(
+            item.extraction_status != "READY" for item in items
+        ),
         "output_blocks": block_count,
         "status_counts": counts,
         "reference_index": str(args.reference_index.resolve())

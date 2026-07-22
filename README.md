@@ -1,10 +1,91 @@
-# GAIA quantity workbook converter for 珠洲市
+# 珠洲市向け GAIA 数量計算書コンバーター
 
-This prototype converts `設計数量総括表(...)` sheets in a quantity-calculation workbook into a GAIA-style `金抜設計書` candidate. For 珠洲市 work, it can validate the transfer against the supplied 積算体系ツリー, 土木工事数量算出要領, and dated 施工パッケージ references.
+数量計算書（Excel または PDF）から数量総括表を読み取り、共通形式へ整理したうえで、GAIA 用の金抜設計書候補を作成するためのツールです。
 
-## Quick start on another Windows PC
+変換処理は GAIA 本体から独立しており、GAIA を起動・操作しません。`gaia_ui_automation.py` は別の試験用ツールであり、通常の変換処理では使用しません。
 
-Requirements: Python 3.11 or newer, Microsoft Excel for reviewing the output, and access to the six governing reference files. GAIA is needed only for the optional Windows UI trial.
+## 現在の推奨運用
+
+安全のため、次の2段階で使用します。
+
+1. 数量計算書を確認用 CSV・JSON へ変換する。
+2. 原本と照合した後、承認済み GAIA テンプレートを使って GAIA 取込候補 Excel を作成する。
+
+特に PDF は埋め込み文字または OCR から抽出するため、確認前のデータを自動的に GAIA コードや施工パッケージへ確定させません。
+
+## 対応ファイル
+
+- Excel `.xlsx` / `.xlsm`
+  - `工種・種別・細別・規格（規格等）・単位・数量` の見出しから列位置を自動判定します。
+  - 列の位置や開始行が変わっても対応できます。
+  - 結合セル、省略された上位区分、数量が次の行に記載されている形式にも対応します。
+- PDF `.pdf`
+  - 文字情報を持つ PDF は、複数ページの `数量総括表`・`数量集計表` を直接読み取ります。
+  - 文字情報のないスキャン PDF は、罫線表を検出して Windows 日本語 OCR で読み取ります。
+- 未登録の形式
+  - 無理に推測せず、診断メッセージを表示して停止します。
+  - 新しい形式は、実例をテストデータとして追加して対応範囲を広げます。
+
+「どのような書式でも100%自動変換」を安全に保証することはできません。その代わり、未知の書式で誤った GAIA データを作らない設計にしています。
+
+## 他の PC で使う最も簡単な方法
+
+### 推奨: Portable EXE を ZIP で配布する
+
+Python をインストールしてもらうのではなく、`GaiaQuantityConverter-win64.zip` を配布する方法を推奨します。
+
+受け取った人の操作は次のとおりです。
+
+1. ZIP を右クリックして「すべて展開」します。
+2. 展開したフォルダー内の `GaiaQuantityConverter.exe` をダブルクリックします。
+3. 「ファイルを選ぶ」で数量計算書を選択します。
+4. 「変換する」を押します。
+5. 完了後、「確認用CSVを開く」で結果を確認します。
+
+数量計算書を EXE のアイコンへドラッグして起動することもできます。
+
+重要事項:
+
+- EXE だけをフォルダー外へ移動しないでください。展開したフォルダー全体で使用します。
+- 元の Excel・PDF は変更しません。
+- Python のインストールは不要です。
+- Windows 10 / 11（64ビット）を対象とします。
+- 画像 PDF を使う PC では、Windows の日本語 OCR 言語が利用可能である必要があります。
+- 現在の試用版 EXE は確認用 CSV・JSONを作成します。GAIA 本体への自動入力は行いません。
+- 署名していない社内試用版 EXE では、Windows SmartScreen や会社のセキュリティ製品による確認が表示される場合があります。本運用前にはコード署名を推奨します。
+
+単一ファイルの `onefile` 形式ではなく、フォルダー形式の `onedir` を採用しています。起動が速く、PDF 用 DLL を確実に同梱でき、ウイルス対策ソフトの誤検知も比較的少ないためです。
+
+### Portable EXE の作成方法
+
+開発用 PC で一度だけ実行します。
+
+```powershell
+cd "C:\Users\chinb\Documents\GAIA automation"
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build_portable_exe.ps1
+```
+
+作成物:
+
+- 実行ファイル: `dist\GaiaQuantityConverter\GaiaQuantityConverter.exe`
+- 配布用 ZIP: `dist\GaiaQuantityConverter-win64.zip`
+
+配布するときは ZIP をそのまま渡してください。
+
+## 開発用 PC のセットアップ
+
+Python から直接実行・修正する場合の手順です。
+
+必要環境:
+
+- Windows 10 / 11
+- Python 3.11 以上
+- 出力確認用の Microsoft Excel
+- 画像 PDF を使う場合は Windows 日本語 OCR
+- GAIA 取込候補まで作る場合は、承認済みテンプレートと基準資料
 
 ```powershell
 git clone YOUR_GITHUB_REPOSITORY_URL
@@ -13,7 +94,41 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
 ```
 
-Build the local reference index once. The index is intentionally excluded from Git because it contains extracted reference text and local file metadata.
+## まず確認用データを作る
+
+### Excel
+
+```powershell
+.\run_quantity_extract.ps1 `
+  -Source "D:\projects\数量計算書.xlsx" `
+  -Output ".\outputs\project_normalized.csv"
+```
+
+### PDF
+
+```powershell
+.\run_quantity_extract.ps1 `
+  -Source "D:\projects\数量計算書.pdf" `
+  -Output ".\outputs\project_normalized.csv"
+```
+
+文字情報を持つ PDF は、埋め込み文字と罫線から複数ページの数量総括表・数量集計表を抽出します。画像 PDF は自動的に Windows OCR に切り替わり、ページ画像・OCR セル画像が診断用として `tmp\quantity-extraction` に保存されます。
+
+確認用 CSV では、最低限次の列を原本と照合してください。
+
+- `work_type`: 工種
+- `category`: 種別
+- `item_name`: 細別
+- `specification`: 規格等
+- `unit`: 単位
+- `quantity`: 数量
+- `extraction_status`: 抽出時の確認状態
+
+PDF の行は、文字 PDF では `PDF_TEXT_REVIEW_REQUIRED`、画像 PDF では `OCR_REVIEW_REQUIRED` になります。GAIA 用レビュー CSV ではどちらも `SOURCE_REVIEW_REQUIRED` となり、原本確認が終わるまで自動確定されません。A1・A2 など複数の数量列に `合計` があれば合計を優先し、合計列が無い場合は列別の明細として残します。
+
+## 珠洲市の基準資料を登録する
+
+次の資料が変更されたときだけ、参照インデックスを再作成します。
 
 ```powershell
 .\build_references.ps1 `
@@ -25,144 +140,130 @@ Build the local reference index once. The index is intentionally excluded from G
   -IshikawaPackagePdf "D:\references\20260319_sekoptankaishikawa0804.pdf"
 ```
 
-Convert a quantity workbook. `PriceDate` must be the official 積算年月 or applicable date, not the workbook filename date unless those are confirmed to be the same.
+生成される `references\suzu_reference_index.json` には、抽出した基準本文とローカルファイル情報が含まれるため Git には登録しません。他の PC で GAIA 取込候補まで作る場合は、基準資料から再作成するか、社内の安全な方法で配布してください。
+
+## GAIA 取込候補 Excel を作る
+
+`PriceDate` はファイル名の日付ではなく、正式な積算年月・適用日を指定してください。
 
 ```powershell
 .\run_converter.ps1 `
   -Source "D:\projects\数量計算書.xlsx" `
   -Template "D:\templates\accepted_GAIA金抜.xlsx" `
-  -PriceDate "2025-10-24" `
-  -TreeCategory "河川改修" `
+  -PriceDate "2026-07-01" `
+  -TreeCategory "道路維持・修繕" `
   -Location "珠洲市〇〇町地内" `
   -Output ".\outputs\project_GAIA取込候補.xlsx"
 ```
 
-Open the generated workbook and its adjacent `_review.csv`. Only `EXACT_CODE` and `PACKAGE_EXACT` rows are candidates for automated GAIA selection. All other statuses require review.
+生成物:
 
-`run_converter.ps1` also reads trusted GAIA codes from the accepted template. A code is copied only when the current reference index has one exact package name, the unit is compatible, and every matching history row has the same GAIA code. Quotations, market-price rows, invalid units, and ambiguous package names are never filled from history. Pass additional accepted files with `-CodeHistory` when useful.
+- `project_GAIA取込候補.xlsx`: GAIA 取込候補
+- `project_GAIA取込候補_review.csv`: 判定根拠・警告・確認状態
 
-## Current GAIA 11.1 trial result
+`run_converter.ps1` は、承認済みテンプレート内の GAIA コード履歴も参照します。ただし、次の条件をすべて満たす場合だけコードを補完します。
 
-The first controlled run on GAIA Cloud `11.1.0.375` completed steps 1-5 in the `テスト` folder:
+- 現年度の施工パッケージ名称が完全一致する。
+- 単位が一致または安全な等価単位である。
+- 同じ名称・単位の過去データが1つの GAIA コードに確定する。
 
-- The candidate was recognized as `珠洲市Excel`, `珠洲市`, `一般土木`, and `金抜き`.
-- GAIA imported 82 processable rows with 0 execution errors.
-- The original candidate had only 3 code occurrences. GAIA paused 2 package selections and left 80 unit-price rows at 0 yen.
-- GAIA exported 4 work-type review messages and 80 unit-price review messages.
-- The accepted historical workbook yielded 20 additional conservative code matches. The improved candidate therefore contains 23 code-bearing rows for the next trial.
+見積、市場単価、単位不一致、複数候補は自動補完しません。
 
-This proves the Excel import and review-export route works. It does not prove official prices: the supplied quantity workbook does not state the approved price date, weekly-rest correction, expense category, or all regional settings.
+## 変換項目の対応
 
-## Safe GAIA trial
-
-1. Create or copy a disposable test project in GAIA. Do not begin with a live estimate.
-2. Use the same Excel import operation that accepts your existing 金抜 workbook and select the generated candidate.
-3. Confirm that 費目・工種・種別・細別, quantities, and units were imported in the expected hierarchy.
-4. For `EXACT_CODE` and `PACKAGE_EXACT`, confirm GAIA selects the expected 施工パッケージ and displays the correct condition screen.
-5. Confirm GAIA supplies prices for the intended region and month. The converter deliberately leaves prices blank.
-6. Compare several representative lines manually before attempting an official estimate.
-
-### Repeat the technical UI trial
-
-Close any hidden GAIA instance left in the Windows notification area before running the command. First validate paths without touching GAIA:
-
-```powershell
-.\run_gaia_trial.ps1 `
-  -Candidate ".\outputs\project_GAIA取込候補.xlsx" `
-  -SourceReview ".\outputs\project_GAIA取込候補_review.csv" `
-  -ProjectName "GAIA自動化テスト_20260722_project" `
-  -DryRun
-```
-
-Then run only against the disposable `テスト` folder. `-ExportReview` asks GAIA to export both review lists and produces `gaia_reconciliation.csv`.
-
-```powershell
-.\run_gaia_trial.ps1 `
-  -Candidate ".\outputs\project_GAIA取込候補.xlsx" `
-  -SourceReview ".\outputs\project_GAIA取込候補_review.csv" `
-  -ProjectName "GAIA自動化テスト_20260722_project" `
-  -ExportReview
-```
-
-The UI runner is profiled for GAIA Cloud 11.1 and is deliberately restricted to project names beginning with `GAIA自動化テスト_`. Keep the PC unlocked while it runs. If a GAIA update changes control names, screenshots are retained in the selected output directory for diagnosis.
-
-To reconcile review exports separately:
-
-```powershell
-python gaia_reconcile.py `
-  --source-review ".\outputs\project_GAIA取込候補_review.csv" `
-  --unit-review ".\outputs\gaia_confirm_unit_prices.xlsx" `
-  --work-review ".\outputs\gaia_confirm_work_types.xlsx" `
-  --output ".\outputs\gaia_reconciliation.csv"
-```
-
-## Conversion model
-
-| Quantity workbook | Normalized field | GAIA candidate |
+| 数量計算書 | 共通データ | GAIA 取込候補 |
 | --- | --- | --- |
-| Sheet suffix, e.g. `上部工` | Section | `費目` |
-| A: 工種 | Work type | `工種` |
-| B: 種別 | Category | `種別` |
-| C: 細別 | Item name | `細別` |
-| D: 規格 | Specification | Condition line |
-| E: 単位 | Unit | Unit |
-| F: 数量 | Quantity | Quantity |
-| H-K | Standard, settings, notes | Match evidence and review status |
+| 数量総括シート・表題 | Section | 費目 |
+| `工種` | Work type | 工種 |
+| `種別` | Category | 種別 |
+| `細別` | Item name | 細別 |
+| `規格` / `規格等` | Specification | 条件・規格行 |
+| `単位` | Unit | 単位 |
+| `数量` | Quantity | 数量 |
+| 積算基準・設定・備考 | Match evidence | 判定根拠・警告 |
 
-The source workbook remains unchanged. The generated workbook is a candidate for a controlled GAIA import test, not a guaranteed official import format.
+元の数量計算書は変更しません。生成した Excel は、正式な設計書ではなく確認・取込試験用の候補です。
 
-## Governing-reference checks
+## 珠洲市基準の確認内容
 
-- `積算体系ツリー`: validates that the preserved 工種・種別・細別 hierarchy can be found in the municipal tree context.
-- `土木工事数量算出要領`: adds page evidence for the quantity classification. It does not recalculate geometric quantities from detailed calculation sheets.
-- `施工パッケージ`: matches the exact package name, unit, condition fields, scope, fiscal year, and effective date. The R8 Ishikawa disaster-area table has priority for 珠洲市 where it contains the package; otherwise the current national table is used.
+- `積算体系ツリー`
+  - 工種・種別・細別の階層が該当事業区分に存在するか確認します。
+- `土木工事数量算出要領`
+  - 数量区分に関係するページを根拠として記録します。
+  - 詳細な幾何計算を再計算する機能ではありません。
+- `施工パッケージ`
+  - 名称、単位、条件区分、対象地域、年度、適用開始日を確認します。
+  - 珠洲市を含む令和8年度石川県災害地区資料に同じパッケージがある場合は、そちらを優先します。
 
-施工パッケージ numbers such as `018` are reference-table numbers, not GAIA `CB...` codes. A GAIA code is written only when it comes from an independently verified rule in `mapping_rules.csv` or an unambiguous same-package/same-unit match in a trusted accepted GAIA workbook. Reference prices are never copied into the 金抜 workbook; GAIA remains responsible for the applicable regional/monthly unit prices.
+施工パッケージ資料の番号（例: `018`）は GAIA の `CB...` コードではありません。GAIA コードは、独立して確認済みのルールまたは承認済み GAIA ファイル内の一意な履歴からのみ設定します。
 
-## Safety classifications
+参考単価は金抜設計書へコピーしません。地域・月・補正条件に応じた価格の確定は GAIA 側で行います。
 
-- `EXACT_CODE`: all reference gates pass and an approved rule supplies a GAIA code.
-- `PACKAGE_EXACT`: the current package, unit, hierarchy, guideline evidence, and conditions pass, but no verified GAIA code is available.
-- `PACKAGE_DATE_REVIEW`: 積算年月 is missing or outside the reference period.
-- `PACKAGE_YEAR_REVIEW`: the workbook's stated standard year differs from the package year.
-- `PACKAGE_UNIT_REVIEW`: the workbook and package units differ.
-- `PACKAGE_CONDITION_REVIEW`: explicit package condition settings are missing.
-- `TREE_REVIEW` / `QUANTITY_RULE_REVIEW`: reference-page evidence is insufficient.
-- `TREE_BRANCH_REVIEW`: the project branch such as 河川改修 or 道路維持・修繕 was not supplied.
-- `MARKET_PRICE_REVIEW`: licensed market-price data and applicable month must be checked.
-- `QUOTATION_REQUIRED`: quotation pricing is required.
-- `BLOCKED_REVIEW`: the source explicitly says the standard is not applicable.
-- `MANUAL_REVIEW`: no exact package can be safely confirmed.
-- `INVALID_QUANTITY`: quantity is missing or non-positive and is excluded.
+## 判定ステータス
 
-## Build the reference index
+- `SOURCE_REVIEW_REQUIRED`: PDF/OCR 行。原本照合が必要です。
+- `EXACT_CODE`: 参照条件を満たし、確認済み GAIA コードがあります。
+- `PACKAGE_EXACT`: 施工パッケージ、単位、階層、条件が一致しますが、確認済み GAIA コードはありません。
+- `PACKAGE_DATE_REVIEW`: 積算年月が未指定、または適用期間外です。
+- `PACKAGE_YEAR_REVIEW`: 数量計算書と施工パッケージの年度が一致しません。
+- `PACKAGE_UNIT_REVIEW`: 数量計算書と施工パッケージの単位が一致しません。
+- `PACKAGE_CONDITION_REVIEW`: 条件区分の設定内容が不足しています。
+- `TREE_REVIEW`: 積算体系ツリーで十分な根拠を確認できません。
+- `QUANTITY_RULE_REVIEW`: 数量算出要領で十分な根拠を確認できません。
+- `TREE_BRANCH_REVIEW`: 河川改修、道路維持・修繕などの事業区分が未指定です。
+- `MARKET_PRICE_REVIEW`: 市販単価データと適用月の確認が必要です。
+- `QUOTATION_REQUIRED`: 見積価格が必要です。
+- `BLOCKED_REVIEW`: 原資料に積算基準の適用不可と記載されています。
+- `MANUAL_REVIEW`: 完全一致する施工パッケージを安全に確定できません。
+- `INVALID_QUANTITY`: 数量が未取得または0以下のため、出力対象外です。
 
-Run this only when the governing reference files change:
+## GAIA Cloud 11.1 での確認結果
+
+GAIA Cloud `11.1.0.375` のテストフォルダーで、技術試験として次を確認済みです。
+
+- 生成候補は `珠洲市Excel`、`珠洲市`、`一般土木`、`金抜き` として認識されました。
+- 処理可能な82行を実行エラー0件で取り込みました。
+- 施工パッケージ選択・単価未確定のレビュー一覧を出力できました。
+- 承認済み過去ファイルから、一意な GAIA コード履歴を保守的に補完できました。
+
+これは Excel 取込経路が動作することの確認です。正式な価格、積算年月、週休補正、経費区分、地域条件の正しさを保証するものではありません。
+
+## 安全な GAIA 取込試験
+
+1. 本番工事ではなく、GAIA 内に使い捨てのテスト工事を作成します。
+2. 生成した GAIA 取込候補 Excel を読み込みます。
+3. 費目・工種・種別・細別、数量、単位の階層を確認します。
+4. `EXACT_CODE` と `PACKAGE_EXACT` でも、GAIA の条件画面を確認します。
+5. 地区・積算月に合う単価が設定されることを確認します。
+6. 代表行を手作業の積算結果と比較してから対象範囲を広げます。
+
+## GAIA UI 自動操作について
+
+`gaia_ui_automation.py` と `run_gaia_trial.ps1` は、GAIA Cloud 11.1 の画面を対象にした別の技術試験です。通常のコンバーターや Portable EXE からは呼び出しません。
+
+画面更新で操作名や配置が変わる可能性があるため、現在は本番工事に使用しません。
+
+## テスト
 
 ```powershell
-python build_reference_index.py `
-  --level-tree "path\to\00_level tree.pdf" `
-  --quantity-guideline "path\to\ss-a-0804(0521kaitei).pdf" `
-  --national-reference-xlsx "path\to\20250319_sekopsankou0804.xlsx" `
-  --national-package-pdf "path\to\20260319_sekoptanka0804.pdf" `
-  --ishikawa-package-xlsx "path\to\20260319_sekoptankaishikawa0804.xlsx" `
-  --ishikawa-package-pdf "path\to\20260319_sekoptankaishikawa0804.pdf" `
-  --output "references\suzu_reference_index.json"
+.\.venv\Scripts\python.exe -m unittest -v
 ```
 
-## Convert a quantity workbook
+現在の自動テストには、次が含まれます。
 
-```powershell
-python gaia_converter.py `
-  --source "path\to\数量計算書.xlsx" `
-  --template "path\to\accepted_金抜設計書.xlsx" `
-  --code-history "path\to\accepted_金抜設計書.xlsx" `
-  --rules mapping_rules.csv `
-  --reference-index "references\suzu_reference_index.json" `
-  --tree-category "河川改修" `
-  --output "outputs\project_GAIA取込候補.xlsx" `
-  --location "珠洲市〇〇町地内" `
-  --price-date 2026-07-01
-```
+- 見出し位置が変わる Excel 数量総括表
+- 省略階層・次行数量・合計行の処理
+- PDF 埋め込み文字表・罫線 OCR 行の確認必須化
+- 施工パッケージ年度・単位・条件区分の安全判定
+- GAIA コード履歴の一意性確認
 
-Review the generated CSV before importing. Confirm the location, work category, district, price date, transport distances, correction rules, market-price contracts, package condition fields, and every item that is not `EXACT_CODE` or `PACKAGE_EXACT`.
+## 今後の UI
+
+Portable EXE は、確認用データを作るための最初の簡易 UI です。実例を増やして抽出精度を確認した後、次を追加する予定です。
+
+- 確認が必要なセルを色付きで表示するレビュー画面
+- 原本 PDF と抽出行の並列表示
+- 承認済み修正を次回へ反映する学習辞書
+- 正式な積算年月・事業区分・テンプレートを確認してから GAIA 取込候補を作る画面
+
+GAIA 本体の UI 自動操作は、コンバーターとは分離したままにします。
