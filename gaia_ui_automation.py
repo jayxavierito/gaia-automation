@@ -250,6 +250,12 @@ def handle_open_dialog(Desktop, candidate: Path, timeout: int) -> None:
     while time.monotonic() < deadline:
         if fill_native_gaia_file_dialog(candidate):
             return
+        for window in Desktop(backend="uia").windows():
+            try:
+                if any("金抜き" in text for text in control_texts(window)):
+                    return
+            except Exception:
+                continue
         for backend in ("uia", "win32"):
             for window in Desktop(backend=backend).windows():
                 try:
