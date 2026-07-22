@@ -4,7 +4,7 @@ This prototype converts `設計数量総括表(...)` sheets in a quantity-calcul
 
 ## Quick start on another Windows PC
 
-Requirements: Python 3.11 or newer, Microsoft Excel for reviewing the output, and access to the six governing reference files. GAIA does not need to be installed on the machine that performs the conversion.
+Requirements: Python 3.11 or newer, Microsoft Excel for reviewing the output, and access to the six governing reference files. GAIA is needed only for the optional Windows UI trial.
 
 ```powershell
 git clone YOUR_GITHUB_REPOSITORY_URL
@@ -39,6 +39,20 @@ Convert a quantity workbook. `PriceDate` must be the official 積算年月 or ap
 
 Open the generated workbook and its adjacent `_review.csv`. Only `EXACT_CODE` and `PACKAGE_EXACT` rows are candidates for automated GAIA selection. All other statuses require review.
 
+`run_converter.ps1` also reads trusted GAIA codes from the accepted template. A code is copied only when the current reference index has one exact package name, the unit is compatible, and every matching history row has the same GAIA code. Quotations, market-price rows, invalid units, and ambiguous package names are never filled from history. Pass additional accepted files with `-CodeHistory` when useful.
+
+## Current GAIA 11.1 trial result
+
+The first controlled run on GAIA Cloud `11.1.0.375` completed steps 1-5 in the `テスト` folder:
+
+- The candidate was recognized as `珠洲市Excel`, `珠洲市`, `一般土木`, and `金抜き`.
+- GAIA imported 82 processable rows with 0 execution errors.
+- The original candidate had only 3 code occurrences. GAIA paused 2 package selections and left 80 unit-price rows at 0 yen.
+- GAIA exported 4 work-type review messages and 80 unit-price review messages.
+- The accepted historical workbook yielded 20 additional conservative code matches. The improved candidate therefore contains 23 code-bearing rows for the next trial.
+
+This proves the Excel import and review-export route works. It does not prove official prices: the supplied quantity workbook does not state the approved price date, weekly-rest correction, expense category, or all regional settings.
+
 ## Safe GAIA trial
 
 1. Create or copy a disposable test project in GAIA. Do not begin with a live estimate.
@@ -46,9 +60,41 @@ Open the generated workbook and its adjacent `_review.csv`. Only `EXACT_CODE` an
 3. Confirm that 費目・工種・種別・細別, quantities, and units were imported in the expected hierarchy.
 4. For `EXACT_CODE` and `PACKAGE_EXACT`, confirm GAIA selects the expected 施工パッケージ and displays the correct condition screen.
 5. Confirm GAIA supplies prices for the intended region and month. The converter deliberately leaves prices blank.
-6. Compare several representative lines manually before attempting UI automation.
+6. Compare several representative lines manually before attempting an official estimate.
 
-The exact GAIA import menu varies by installation/version, so the first trial should record the menu name, importer messages, and any rejected rows. Those results will define the next automation step.
+### Repeat the technical UI trial
+
+Close any hidden GAIA instance left in the Windows notification area before running the command. First validate paths without touching GAIA:
+
+```powershell
+.\run_gaia_trial.ps1 `
+  -Candidate ".\outputs\project_GAIA取込候補.xlsx" `
+  -SourceReview ".\outputs\project_GAIA取込候補_review.csv" `
+  -ProjectName "GAIA自動化テスト_20260722_project" `
+  -DryRun
+```
+
+Then run only against the disposable `テスト` folder. `-ExportReview` asks GAIA to export both review lists and produces `gaia_reconciliation.csv`.
+
+```powershell
+.\run_gaia_trial.ps1 `
+  -Candidate ".\outputs\project_GAIA取込候補.xlsx" `
+  -SourceReview ".\outputs\project_GAIA取込候補_review.csv" `
+  -ProjectName "GAIA自動化テスト_20260722_project" `
+  -ExportReview
+```
+
+The UI runner is profiled for GAIA Cloud 11.1 and is deliberately restricted to project names beginning with `GAIA自動化テスト_`. Keep the PC unlocked while it runs. If a GAIA update changes control names, screenshots are retained in the selected output directory for diagnosis.
+
+To reconcile review exports separately:
+
+```powershell
+python gaia_reconcile.py `
+  --source-review ".\outputs\project_GAIA取込候補_review.csv" `
+  --unit-review ".\outputs\gaia_confirm_unit_prices.xlsx" `
+  --work-review ".\outputs\gaia_confirm_work_types.xlsx" `
+  --output ".\outputs\gaia_reconciliation.csv"
+```
 
 ## Conversion model
 
@@ -71,7 +117,7 @@ The source workbook remains unchanged. The generated workbook is a candidate for
 - `土木工事数量算出要領`: adds page evidence for the quantity classification. It does not recalculate geometric quantities from detailed calculation sheets.
 - `施工パッケージ`: matches the exact package name, unit, condition fields, scope, fiscal year, and effective date. The R8 Ishikawa disaster-area table has priority for 珠洲市 where it contains the package; otherwise the current national table is used.
 
-施工パッケージ numbers such as `018` are reference-table numbers, not GAIA `CB...` codes. A GAIA code is written only when it comes from an independently verified rule in `mapping_rules.csv`. Reference prices are never copied into the 金抜 workbook; GAIA remains responsible for the applicable regional/monthly unit prices.
+施工パッケージ numbers such as `018` are reference-table numbers, not GAIA `CB...` codes. A GAIA code is written only when it comes from an independently verified rule in `mapping_rules.csv` or an unambiguous same-package/same-unit match in a trusted accepted GAIA workbook. Reference prices are never copied into the 金抜 workbook; GAIA remains responsible for the applicable regional/monthly unit prices.
 
 ## Safety classifications
 
@@ -110,6 +156,7 @@ python build_reference_index.py `
 python gaia_converter.py `
   --source "path\to\数量計算書.xlsx" `
   --template "path\to\accepted_金抜設計書.xlsx" `
+  --code-history "path\to\accepted_金抜設計書.xlsx" `
   --rules mapping_rules.csv `
   --reference-index "references\suzu_reference_index.json" `
   --tree-category "河川改修" `

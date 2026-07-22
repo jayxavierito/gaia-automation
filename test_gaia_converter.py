@@ -6,9 +6,12 @@ from openpyxl import Workbook
 
 from gaia_converter import (
     BoqItem,
+    GaiaCodeHistoryEntry,
+    apply_gaia_code_history,
     apply_reference_index,
     classify_item,
     compare_units,
+    extract_gaia_code_history,
     extract_boq_items,
     normalize_match_text,
 )
@@ -217,6 +220,115 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(item.package_match_type, "AMBIGUOUS_EXACT_NAME")
         self.assertEqual(item.match_status, "MANUAL_REVIEW")
         self.assertEqual(item.package_no, "")
+
+    def test_extracts_and_applies_unambiguous_gaia_code_history(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "本工事費内訳表"
+        sheet["E4"] = "表層(車道・路肩部)"
+        sheet["J4"] = "m2"
+        sheet["M4"] = "[CB410260]"
+        sheet["D5"] = "3.0m超 60mm"
+        path = Path.cwd() / "test_history.xlsx"
+        try:
+            workbook.save(path)
+            entries = extract_gaia_code_history(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
+        apply_reference_index(
+            [item],
+            self.make_reference_index(),
+            price_date=date(2026, 7, 1),
+            district="珠洲",
+            tree_category="河川改修",
+        )
+        classify_item(item, reference_index_active=True)
+        apply_gaia_code_history([item], entries)
+        classify_item(item, reference_index_active=True)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(item.gaia_code, "CB410260")
+        self.assertEqual(item.match_status, "EXACT_CODE")
+        self.assertTrue(item.matched_rule.startswith("GAIA_HISTORY:"))
+
+    def test_history_code_is_not_applied_when_codes_are_ambiguous(self):
+        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
+        apply_reference_index(
+            [item],
+            self.make_reference_index(),
+            price_date=date(2026, 7, 1),
+            district="珠洲",
+            tree_category="河川改修",
+        )
+        classify_item(item, reference_index_active=True)
+        entries = [
+            GaiaCodeHistoryEntry(
+                code=code,
+                name="表層(車道・路肩部)",
+                condition="",
+                unit="m2",
+                source_file="history.xlsx",
+                source_sheet="本工事費内訳表",
+                source_row=row,
+            )
+            for code, row in (("CB410260", 4), ("CB410240", 8))
+        ]
+
+        apply_gaia_code_history([item], entries)
+
+        self.assertEqual(item.gaia_code, "")
+        self.assertEqual(item.match_status, "PACKAGE_EXACT")
+
+    def test_history_code_does_not_override_quotation_review(self):
+        item = self.make_package_item(standard="見積り")
+        apply_reference_index(
+            [item],
+            self.make_reference_index(),
+            price_date=date(2026, 7, 1),
+            district="珠洲",
+            tree_category="河川改修",
+        )
+        classify_item(item, reference_index_active=True)
+        entry = GaiaCodeHistoryEntry(
+            code="CB410260",
+            name="表層(車道・路肩部)",
+            condition="",
+            unit="m2",
+            source_file="history.xlsx",
+            source_sheet="本工事費内訳表",
+            source_row=4,
+        )
+
+        apply_gaia_code_history([item], [entry])
+
+        self.assertEqual(item.gaia_code, "")
+        self.assertEqual(item.match_status, "QUOTATION_REQUIRED")
+
+    def test_history_code_requires_unit_evidence(self):
+        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
+        apply_reference_index(
+            [item],
+            self.make_reference_index(),
+            price_date=date(2026, 7, 1),
+            district="珠洲",
+            tree_category="河川改修",
+        )
+        classify_item(item, reference_index_active=True)
+        entry = GaiaCodeHistoryEntry(
+            code="CB410260",
+            name="表層(車道・路肩部)",
+            condition="",
+            unit="",
+            source_file="history.xlsx",
+            source_sheet="本工事費内訳表",
+            source_row=4,
+        )
+
+        apply_gaia_code_history([item], [entry])
+
+        self.assertEqual(item.gaia_code, "")
 
 
 if __name__ == "__main__":

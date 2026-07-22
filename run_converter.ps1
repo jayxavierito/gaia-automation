@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $TreeCategory,
     [string] $ReferenceIndex = ".\references\suzu_reference_index.json",
     [string] $Rules = ".\mapping_rules.csv",
+    [string[]] $CodeHistory = @(),
     [string] $District = "",
     [string] $Location = "",
     [string] $WorkCategory = "",
@@ -18,7 +19,11 @@ $python = if (Test-Path ".\.venv\Scripts\python.exe") {
     "python"
 }
 
-foreach ($path in @($Source, $Template, $ReferenceIndex, $Rules)) {
+if ($CodeHistory.Count -eq 0) {
+    $CodeHistory = @($Template)
+}
+
+foreach ($path in @($Source, $Template, $ReferenceIndex, $Rules) + $CodeHistory) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required file not found: $path"
     }
@@ -38,6 +43,10 @@ $converterArgs = @(
     "--output", $Output,
     "--price-date", $PriceDate
 )
+
+foreach ($historyPath in $CodeHistory) {
+    $converterArgs += @("--code-history", $historyPath)
+}
 
 if ($District) {
     $converterArgs += @("--district", $District)

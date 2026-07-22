@@ -20,6 +20,7 @@ SUMMARY_SHEET_RE = re.compile(r"^設計数量総括表[（(](.+?)[）)]$")
 HEADER_NAMES = {"工種", "種別", "細別", "規格", "単位", "数量"}
 BLANK_VALUES = {"", "-", "―"}
 SOURCE_YEAR_RE = re.compile(r"(?:令和|R)\s*(\d+)", re.IGNORECASE)
+GAIA_CODE_RE = re.compile(r"^\[([A-Z]{2}\d{6})\]$")
 
 
 @dataclass
@@ -31,6 +32,17 @@ class MappingRule:
     gaia_code: str = ""
     condition_append: str = ""
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class GaiaCodeHistoryEntry:
+    code: str
+    name: str
+    condition: str
+    unit: str
+    source_file: str
+    source_sheet: str
+    source_row: int
 
 
 @dataclass
@@ -310,6 +322,102 @@ def apply_mapping_rules(items: Iterable[BoqItem], rules: list[MappingRule]) -> N
             if rule.notes:
                 append_warning(item, rule.notes)
             break
+
+
+def extract_gaia_code_history(path: Path) -> list[GaiaCodeHistoryEntry]:
+    """Read trusted GAIA codes from an already accepted 金抜 workbook."""
+    workbook = load_workbook(path, data_only=False, read_only=True)
+    if "本工事費内訳表" not in workbook.sheetnames:
+        workbook.close()
+        raise ValueError(f"コード履歴に本工事費内訳表がありません: {path}")
+
+    sheet = workbook["本工事費内訳表"]
+    rows = list(sheet.iter_rows(min_col=1, max_col=13, values_only=True))
+    entries: list[GaiaCodeHistoryEntry] = []
+    for index, values in enumerate(rows):
+        code_match = GAIA_CODE_RE.fullmatch(clean_text(values[12]))
+        if not code_match:
+            continue
+
+        name = next(
+            (clean_text(value) for value in reversed(values[:5]) if clean_text(value)),
+            "",
+        )
+        next_values = rows[index + 1] if index + 1 < len(rows) else ()
+        condition = next(
+            (
+                clean_text(value)
+                for value in reversed(next_values[:5])
+                if clean_text(value)
+            ),
+            "",
+        )
+        if not name:
+            continue
+        entries.append(
+            GaiaCodeHistoryEntry(
+                code=code_match.group(1),
+                name=name,
+                condition=condition,
+                unit=clean_text(values[9]),
+                source_file=path.name,
+                source_sheet=sheet.title,
+                source_row=index + 1,
+            )
+        )
+    workbook.close()
+    return entries
+
+
+HISTORY_CODE_ELIGIBLE_STATUSES = {
+    "PACKAGE_EXACT",
+    "PACKAGE_DATE_REVIEW",
+    "PACKAGE_YEAR_REVIEW",
+    "PACKAGE_CONDITION_REVIEW",
+    "TREE_BRANCH_REVIEW",
+    "TREE_REVIEW",
+    "QUANTITY_RULE_REVIEW",
+}
+
+
+def apply_gaia_code_history(
+    items: Iterable[BoqItem], entries: Iterable[GaiaCodeHistoryEntry]
+) -> None:
+    """Apply only one-code, same-package, unit-compatible history matches."""
+    entries_by_name: dict[str, list[GaiaCodeHistoryEntry]] = {}
+    for entry in entries:
+        entries_by_name.setdefault(normalize_match_text(entry.name), []).append(entry)
+
+    for item in items:
+        if item.gaia_code or item.match_status not in HISTORY_CODE_ELIGIBLE_STATUSES:
+            continue
+        if item.package_match_type != "EXACT_NAME" or not item.package_name:
+            continue
+
+        candidates = entries_by_name.get(normalize_match_text(item.package_name), [])
+        target_unit = item.package_unit or item.unit
+        compatible = [
+            entry
+            for entry in candidates
+            if entry.unit
+            and compare_units(target_unit, entry.unit) in {"MATCH", "EQUIVALENT"}
+        ]
+        codes = {entry.code for entry in compatible}
+        if len(codes) != 1:
+            continue
+
+        evidence = min(compatible, key=lambda entry: entry.source_row)
+        item.gaia_code = next(iter(codes))
+        item.gaia_item_name = item.package_name
+        item.matched_rule = (
+            f"GAIA_HISTORY:{evidence.source_file}:"
+            f"{evidence.source_sheet}!{evidence.source_row}"
+        )
+        append_warning(
+            item,
+            f"既存GAIA設計書の同一施工パッケージ名・単位から"
+            f"コード候補 {item.gaia_code} を補完しました",
+        )
 
 
 def load_reference_index(path: Path | None) -> dict:
@@ -906,6 +1014,16 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--review", type=Path)
     parser.add_argument("--rules", type=Path)
+    parser.add_argument(
+        "--code-history",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "GAIAコードを抽出する既存の取込実績Excel。複数回指定できます。"
+            "同一施工パッケージ名・単位が1コードに確定する場合だけ補完します。"
+        ),
+    )
     parser.add_argument("--reference-index", type=Path)
     parser.add_argument(
         "--tree-category",
@@ -937,6 +1055,16 @@ def main() -> int:
     for item in items:
         classify_item(item, reference_index_active=bool(reference_index))
 
+    code_history: list[GaiaCodeHistoryEntry] = []
+    for history_path in args.code_history:
+        if not history_path.exists():
+            raise FileNotFoundError(f"GAIAコード履歴がありません: {history_path}")
+        code_history.extend(extract_gaia_code_history(history_path))
+    if code_history:
+        apply_gaia_code_history(items, code_history)
+        for item in items:
+            classify_item(item, reference_index_active=bool(reference_index))
+
     review_path = args.review or args.output.with_name(
         f"{args.output.stem}_review.csv"
     )
@@ -963,6 +1091,10 @@ def main() -> int:
         "reference_index": str(args.reference_index.resolve())
         if args.reference_index
         else "",
+        "code_history_entries": len(code_history),
+        "history_codes_applied": sum(
+            item.matched_rule.startswith("GAIA_HISTORY:") for item in items
+        ),
         "price_date": price_date.isoformat() if price_date else "",
         "tree_category": clean_text(args.tree_category),
         "output": str(args.output.resolve()),
