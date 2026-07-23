@@ -17,6 +17,11 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.worksheet import Worksheet
 from pypdf import PdfReader
 
+from gaia_catalog import (
+    GaiaCatalogEntry,
+    load_gaia_catalog,
+    match_gaia_catalog,
+)
 from quantity_extractors import ExtractionResult, extract_quantity_source
 
 
@@ -133,6 +138,18 @@ class BoqItem:
     source_standard_year: int | None = None
     source_standard_status: str = ""
     package_suggestions: str = ""
+    output_level1: str = ""
+    output_level2: str = ""
+    output_level3: str = ""
+    output_level4: str = ""
+    catalog_status: str = ""
+    catalog_score: float = 0.0
+    catalog_name_score: float = 0.0
+    catalog_specification_score: float = 0.0
+    catalog_candidate_count: int = 0
+    catalog_path_safe: bool = False
+    catalog_code_safe: bool = False
+    catalog_source_row: int | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -305,13 +322,153 @@ def boq_items_from_extraction(extraction: ExtractionResult) -> list[BoqItem]:
             extraction_warnings=list(record.extraction_warnings),
         )
         item.gaia_item_name = item.item_name
-        item.gaia_condition = combine_unique(
-            item.specification, item.setting, item.remarks
-        )
+        item.gaia_condition = combine_unique(item.specification, item.setting)
         for warning in item.extraction_warnings:
             append_warning(item, warning)
         items.append(item)
     return items
+
+
+def apply_gaia_catalog(
+    items: Iterable[BoqItem], catalog: Iterable[GaiaCatalogEntry]
+) -> None:
+    item_list = list(items)
+    catalog_entries = list(catalog)
+    for item in item_list:
+        item.output_level1 = normalize_hierarchy_label(item.section) or "本工事費"
+        item.output_level2 = normalize_hierarchy_label(item.work_type) or "工種未確認"
+        item.output_level3 = normalize_hierarchy_label(item.category) or "種別未確認"
+        item.output_level4 = clean_text(item.item_name)
+        item.gaia_item_name = item.output_level4
+        item.gaia_condition = combine_unique(item.specification, item.setting)
+
+        match = match_gaia_catalog(
+            catalog_entries,
+            item_name=item.item_name,
+            specification=item.gaia_condition,
+            unit=item.unit,
+            work_type=item.work_type,
+            category=item.category,
+        )
+        item.catalog_status = match.status
+        item.catalog_score = match.score
+        item.catalog_name_score = match.name_score
+        item.catalog_specification_score = match.specification_score
+        item.catalog_candidate_count = match.candidate_count
+        item.catalog_path_safe = match.path_safe
+        item.catalog_code_safe = match.code_safe
+        if match.entry is None:
+            continue
+
+        item.catalog_source_row = match.entry.source_row
+        if match.status in {"EXACT_CODE", "EXACT_PATH", "FUZZY_PATH"}:
+            item.output_level4 = match.entry.item_name
+            item.gaia_item_name = match.entry.item_name
+        if match.path_safe and not clean_text(item.work_type):
+            item.output_level2 = match.entry.level2 or item.output_level2
+        if match.path_safe and not clean_text(item.category):
+            item.output_level3 = match.entry.level3 or item.output_level3
+        if (
+            match.code_safe
+            and item.extraction_status == "READY"
+            and item.quantity is not None
+            and item.quantity > 0
+        ):
+            item.gaia_code = match.entry.code
+        item.matched_rule = (
+            f"GAIA_CATALOG:{match.entry.source_file}:"
+            f"本工事費内訳表!{match.entry.source_row}"
+        )
+
+    # A confirmed item path is useful evidence for unmatched siblings in the
+    # same source 工種/種別 group, but never supplies a GAIA code.
+    grouped: dict[tuple[str, str, str, str], list[BoqItem]] = defaultdict(list)
+    for item in item_list:
+        work_key = normalize_match_text(item.work_type)
+        category_key = normalize_match_text(item.category)
+        if not work_key and not category_key:
+            continue
+        grouped[
+            (
+                clean_text(item.source_sheet),
+                normalize_match_text(item.section),
+                work_key,
+                category_key,
+            )
+        ].append(item)
+    for group_items in grouped.values():
+        confirmed_paths = {
+            (item.output_level2, item.output_level3)
+            for item in group_items
+            if item.catalog_path_safe
+        }
+        if len(confirmed_paths) != 1:
+            continue
+        level2, level3 = next(iter(confirmed_paths))
+        for item in group_items:
+            if item.catalog_path_safe:
+                continue
+            if not clean_text(item.work_type):
+                item.output_level2 = level2
+            if not clean_text(item.category):
+                item.output_level3 = level3
+            if item.catalog_status in {"NOT_FOUND", "AMBIGUOUS", "EXACT_AMBIGUOUS"}:
+                item.catalog_status = f"{item.catalog_status}_GROUP_PATH"
+
+
+def classify_schema_item(item: BoqItem) -> None:
+    if item.quantity is None or item.quantity <= 0:
+        item.match_status = "INVALID_QUANTITY"
+        item.confidence = 0.0
+        append_warning(item, "数量を取得できない、または数量が0以下です")
+    elif item.extraction_status != "READY":
+        item.match_status = "SOURCE_REVIEW_REQUIRED"
+        item.confidence = min(0.5, item.extraction_confidence)
+        append_warning(item, "原本照合が完了するまでGAIAコードを確定しません")
+    elif item.gaia_code and item.catalog_code_safe:
+        item.match_status = "CATALOG_EXACT_CODE"
+        item.confidence = 0.98
+    elif item.catalog_status in {"EXACT_PATH", "EXACT_CODE"}:
+        item.match_status = "GAIA_NAME_SEARCH"
+        item.confidence = 0.9
+    elif item.catalog_status == "FUZZY_PATH":
+        item.match_status = "GAIA_NAME_SEARCH_REVIEW"
+        item.confidence = 0.65
+    elif item.catalog_status.endswith("_GROUP_PATH"):
+        item.match_status = "GAIA_NAME_SEARCH_GROUP"
+        item.confidence = 0.55
+    else:
+        item.match_status = "GAIA_NAME_SEARCH_REQUIRED"
+        item.confidence = 0.35
+
+
+def infer_work_category(project_name: str, items: Iterable[BoqItem]) -> str:
+    scores = {
+        "橋梁工事": 0,
+        "下水道工事（２）": 0,
+        "道路工事": 0,
+    }
+    terms = {
+        "橋梁工事": ("橋", "橋梁", "支承", "伸縮装置", "地覆", "胸壁", "床版", "主桁"),
+        "下水道工事（２）": ("下水", "管渠", "マンホール", "汚水", "雨水", "推進工"),
+        "道路工事": ("道路", "舗装", "路盤", "区画線", "側溝"),
+    }
+    project_text = clean_text(project_name)
+    for category, keywords in terms.items():
+        if any(keyword in project_text for keyword in keywords):
+            scores[category] += 3
+    for item in items:
+        context = combine_unique(
+            item.work_type,
+            item.category,
+            item.item_name,
+            item.specification,
+        )
+        for category, keywords in terms.items():
+            if any(keyword in context for keyword in keywords):
+                scores[category] += 1
+    selected, score = max(scores.items(), key=lambda pair: pair[1])
+    return selected if score >= 2 else ""
 
 
 def extract_boq_items(
@@ -1195,25 +1352,23 @@ def build_output_blocks(items: Iterable[BoqItem]) -> list[OutputBlock]:
     for item in items:
         if item.match_status == "INVALID_QUANTITY":
             continue
-        section = clean_text(item.tree_level1 or item.section) or "工事区分未確認"
-        work_type = clean_text(item.tree_level2 or item.work_type) or "工種未確認"
-        category = clean_text(
-            item.tree_level3 or item.category
-        ) or "種別未確認"
+        section = clean_text(item.output_level1 or item.section) or "本工事費"
+        work_type = clean_text(item.output_level2 or item.work_type) or "工種未確認"
+        category = clean_text(item.output_level3 or item.category) or "種別未確認"
         item_name = clean_text(
-            item.tree_level4 or item.gaia_item_name or item.item_name
+            item.output_level4 or item.gaia_item_name or item.item_name
         )
         if section != previous_section:
-            blocks.append(OutputBlock("fee", section, "レベル1 工事区分"))
+            blocks.append(OutputBlock("fee", section, "費目行"))
             previous_section = section
             previous_work_type = ""
             previous_category = ""
         if work_type != previous_work_type:
-            blocks.append(OutputBlock("work", work_type, "レベル2 工種"))
+            blocks.append(OutputBlock("work", work_type, "工種行"))
             previous_work_type = work_type
             previous_category = ""
         if category != previous_category:
-            blocks.append(OutputBlock("category", category, "レベル3 種別"))
+            blocks.append(OutputBlock("category", category, "種別行"))
             previous_category = category
         blocks.append(OutputBlock("item", item_name, item=item))
     return blocks
@@ -1249,28 +1404,9 @@ def write_block(sheet: Worksheet, block_index: int, block: OutputBlock) -> None:
     assert item is not None
     sheet.cell(row, 4).value = block.value
     sheet.cell(row, 8).value = item.quantity
-    sheet.cell(row, 10).value = (
-        item.package_unit
-        if item.package_unit_status == "EQUIVALENT"
-        else item.unit
-    )
+    sheet.cell(row, 10).value = item.unit
     sheet.cell(row, 13).value = f"[{item.gaia_code}]" if item.gaia_code else ""
     sheet.cell(row + 1, 4).value = item.gaia_condition
-    sheet.cell(row + 1, 13).value = item.standard
-    sheet.cell(row + 2, 13).value = combine_unique(
-        item.source_reference,
-        package_reference_label(item),
-        f"TREE[{item.tree_category}] p.{item.tree_pages}"
-        if item.tree_pages
-        else "",
-        f"数量要領 p.{item.guideline_pages}" if item.guideline_pages else "",
-    )
-    sheet.cell(row + 3, 13).value = combine_unique(
-        item.match_status,
-        item.package_condition_status,
-        item.notes,
-        "; ".join(item.warnings),
-    )
 
 
 def build_gaia_candidate(
@@ -1376,6 +1512,18 @@ def write_review_csv(path: Path, items: list[BoqItem]) -> None:
         "source_standard_year",
         "source_standard_status",
         "package_suggestions",
+        "output_level1",
+        "output_level2",
+        "output_level3",
+        "output_level4",
+        "catalog_status",
+        "catalog_score",
+        "catalog_name_score",
+        "catalog_specification_score",
+        "catalog_candidate_count",
+        "catalog_path_safe",
+        "catalog_code_safe",
+        "catalog_source_row",
         "warnings",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -1403,28 +1551,45 @@ def main() -> int:
         help="PDFページとOCRセルを診断用に保存するディレクトリ。",
     )
     parser.add_argument("--template", required=True, type=Path)
+    parser.add_argument(
+        "--catalog",
+        type=Path,
+        default=Path(__file__).resolve().parent
+        / "assets"
+        / "gaia_import_catalog.json",
+        help="GAIA取込実績から作成した名称・コードカタログ。",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--review", type=Path)
-    parser.add_argument("--rules", type=Path)
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--code-history",
         action="append",
         default=[],
         type=Path,
-        help=(
-            "GAIAコードを抽出する既存の取込実績Excel。複数回指定できます。"
-            "同一施工パッケージ名・単位が1コードに確定する場合だけ補完します。"
-        ),
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument("--reference-index", type=Path)
+    parser.add_argument(
+        "--reference-index",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--tree-category",
         default="",
-        help="積算体系ツリーの事業区分。例: 河川改修、道路新設・改築、道路維持・修繕",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--project-name", default="")
     parser.add_argument("--location", default="")
-    parser.add_argument("--work-category", default="橋梁工事")
+    parser.add_argument(
+        "--work-category",
+        default="",
+        help="鏡シートの工種区分。省略時は工事名と明細から推定します。",
+    )
     parser.add_argument("--district", default="珠洲")
     parser.add_argument(
         "--price-date",
@@ -1443,30 +1608,13 @@ def main() -> int:
         price_date_source = "USER"
     else:
         price_date, price_date_source = detect_estimate_date(args.source)
-    rules = load_mapping_rules(args.rules)
-    apply_mapping_rules(items, rules)
-    reference_index = load_reference_index(args.reference_index)
-    if reference_index:
-        apply_reference_index(
-            items,
-            reference_index,
-            price_date=price_date,
-            district=clean_text(args.district),
-            tree_category=clean_text(args.tree_category),
-            project_name=project_name,
-        )
+    catalog = load_gaia_catalog(args.catalog)
+    apply_gaia_catalog(items, catalog)
     for item in items:
-        classify_item(item, reference_index_active=bool(reference_index))
-
-    code_history: list[GaiaCodeHistoryEntry] = []
-    for history_path in args.code_history:
-        if not history_path.exists():
-            raise FileNotFoundError(f"GAIAコード履歴がありません: {history_path}")
-        code_history.extend(extract_gaia_code_history(history_path))
-    if code_history:
-        apply_gaia_code_history(items, code_history)
-        for item in items:
-            classify_item(item, reference_index_active=bool(reference_index))
+        classify_schema_item(item)
+    work_category = clean_text(args.work_category) or infer_work_category(
+        project_name, items
+    )
 
     review_path = args.review or args.output.with_name(
         f"{args.output.stem}_review.csv"
@@ -1478,7 +1626,7 @@ def main() -> int:
         project_name=project_name,
         items=items,
         location=clean_text(args.location),
-        work_category=clean_text(args.work_category),
+        work_category=work_category,
         district=clean_text(args.district),
         price_date=price_date,
     )
@@ -1495,16 +1643,17 @@ def main() -> int:
         ),
         "output_blocks": block_count,
         "status_counts": counts,
-        "reference_index": str(args.reference_index.resolve())
-        if args.reference_index
-        else "",
-        "code_history_entries": len(code_history),
-        "history_codes_applied": sum(
-            item.matched_rule.startswith("GAIA_HISTORY:") for item in items
+        "catalog": str(args.catalog.resolve()),
+        "catalog_entries": len(catalog),
+        "catalog_name_matched": sum(
+            item.catalog_status.startswith("EXACT")
+            or item.catalog_status == "FUZZY_PATH"
+            for item in items
         ),
+        "catalog_codes_applied": sum(bool(item.gaia_code) for item in items),
         "price_date": price_date.isoformat(),
         "price_date_source": price_date_source,
-        "tree_category": items[0].tree_category if items else clean_text(args.tree_category),
+        "work_category": work_category,
         "output": str(args.output.resolve()),
         "review": str(review_path.resolve()),
     }

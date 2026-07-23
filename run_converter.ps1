@@ -1,14 +1,11 @@
 param(
     [Parameter(Mandatory = $true)] [string] $Source,
     [string] $Template = ".\assets\gaia_suzu_7sheet_template.xlsx",
+    [string] $Catalog = ".\assets\gaia_import_catalog.json",
     [string] $PriceDate = "",
-    [string] $TreeCategory = "",
-    [string] $ReferenceIndex = ".\references\suzu_reference_index.json",
-    [string] $Rules = ".\mapping_rules.csv",
-    [string[]] $CodeHistory = @(),
-    [string] $District = "珠洲",
+    [string] $District = "",
     [string] $Location = "",
-    [string] $WorkCategory = "橋梁工事",
+    [string] $WorkCategory = "",
     [string] $ExtractionWorkDirectory = ".\tmp\quantity-extraction",
     [string] $Output = ".\outputs\GAIA_candidate.xlsx"
 )
@@ -20,11 +17,7 @@ $python = if (Test-Path ".\.venv\Scripts\python.exe") {
     "python"
 }
 
-if (-not (Test-Path -LiteralPath $ReferenceIndex)) {
-    $ReferenceIndex = ".\assets\suzu_level_tree_index.json"
-}
-
-foreach ($path in @($Source, $Template, $ReferenceIndex, $Rules) + $CodeHistory) {
+foreach ($path in @($Source, $Template, $Catalog)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required file not found: $path"
     }
@@ -38,8 +31,7 @@ $converterArgs = @(
     ".\gaia_converter.py",
     "--source", $Source,
     "--template", $Template,
-    "--rules", $Rules,
-    "--reference-index", $ReferenceIndex,
+    "--catalog", $Catalog,
     "--output", $Output,
     "--extraction-work-dir", $ExtractionWorkDirectory
 )
@@ -47,14 +39,6 @@ $converterArgs = @(
 if ($PriceDate) {
     $converterArgs += @("--price-date", $PriceDate)
 }
-if ($TreeCategory) {
-    $converterArgs += @("--tree-category", $TreeCategory)
-}
-
-foreach ($historyPath in $CodeHistory) {
-    $converterArgs += @("--code-history", $historyPath)
-}
-
 if ($District) {
     $converterArgs += @("--district", $District)
 }

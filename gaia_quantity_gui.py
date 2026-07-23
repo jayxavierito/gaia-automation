@@ -10,15 +10,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+from gaia_catalog import load_gaia_catalog
 from gaia_converter import (
-    apply_mapping_rules,
-    apply_reference_index,
+    apply_gaia_catalog,
     boq_items_from_extraction,
     build_gaia_candidate,
-    classify_item,
+    classify_schema_item,
     detect_estimate_date,
-    load_mapping_rules,
-    load_reference_index,
+    infer_work_category,
     write_review_csv,
 )
 from quantity_extractors import extract_quantity_source
@@ -56,34 +55,22 @@ def convert_to_gaia_files(source_path: Path, output_directory: Path):
     items = boq_items_from_extraction(result)
     price_date, price_date_source = detect_estimate_date(source_path)
 
-    rules_path = first_existing_path(
-        resource_path("mapping_rules.csv"),
-        Path(__file__).resolve().parent / "mapping_rules.csv",
-    )
-    apply_mapping_rules(items, load_mapping_rules(rules_path))
-
-    reference_path = first_existing_path(
-        resource_path("references", "suzu_reference_index.json"),
-        resource_path("assets", "suzu_level_tree_index.json"),
-        Path(__file__).resolve().parent
-        / "references"
-        / "suzu_reference_index.json",
+    catalog_path = first_existing_path(
+        resource_path("assets", "gaia_import_catalog.json"),
         Path(__file__).resolve().parent
         / "assets"
-        / "suzu_level_tree_index.json",
+        / "gaia_import_catalog.json",
     )
-    reference_index = load_reference_index(reference_path)
-    if reference_index:
-        apply_reference_index(
-            items,
-            reference_index,
-            price_date=price_date,
-            district="珠洲",
-            tree_category="",
-            project_name=result.project_name,
+    if catalog_path is None:
+        raise FileNotFoundError(
+            "GAIA取込カタログがありません。"
+            "assets\\gaia_import_catalog.json を確認してください。"
         )
+    catalog = load_gaia_catalog(catalog_path)
+    apply_gaia_catalog(items, catalog)
     for item in items:
-        classify_item(item, reference_index_active=bool(reference_index))
+        classify_schema_item(item)
+    work_category = infer_work_category(result.project_name, items)
 
     template_path = first_existing_path(
         resource_path("assets", "gaia_suzu_7sheet_template.xlsx"),
@@ -109,7 +96,7 @@ def convert_to_gaia_files(source_path: Path, output_directory: Path):
         project_name=result.project_name,
         items=items,
         location="",
-        work_category="橋梁工事",
+        work_category=work_category,
         district="珠洲",
         price_date=price_date,
     )
@@ -121,14 +108,19 @@ def convert_to_gaia_files(source_path: Path, output_directory: Path):
                     "output": str(xlsx_path.resolve()),
                     "review": str(review_path.resolve()),
                     "template": str(template_path.resolve()),
-                    "reference_index": (
-                        str(reference_path.resolve()) if reference_path else ""
-                    ),
+                    "catalog": str(catalog_path.resolve()),
                     "price_date": price_date.isoformat(),
                     "price_date_source": price_date_source,
-                    "tree_category": items[0].tree_category if items else "",
-                    "level4_verified": sum(
-                        item.tree_status == "LEVEL4_VERIFIED" for item in items
+                    "catalog_path_matched": sum(
+                        item.catalog_path_safe for item in items
+                    ),
+                    "catalog_name_matched": sum(
+                        item.catalog_status.startswith("EXACT")
+                        or item.catalog_status == "FUZZY_PATH"
+                        for item in items
+                    ),
+                    "catalog_codes_applied": sum(
+                        bool(item.gaia_code) for item in items
                     ),
                     "output_blocks": block_count,
                 },
@@ -407,11 +399,14 @@ class ConverterApp:
             ) = convert_to_gaia_files(source_path, output_directory)
             review_count = sum(
                 item.extraction_status != "READY"
-                or item.tree_status != "LEVEL4_VERIFIED"
+                or item.catalog_status.startswith(("NOT_FOUND", "AMBIGUOUS"))
+                or item.catalog_status == "EXACT_AMBIGUOUS"
                 for item in items
             )
-            verified_count = sum(
-                item.tree_status == "LEVEL4_VERIFIED" for item in items
+            matched_count = sum(
+                item.catalog_status.startswith("EXACT")
+                or item.catalog_status == "FUZZY_PATH"
+                for item in items
             )
             self.root.after(
                 0,
@@ -419,7 +414,7 @@ class ConverterApp:
                 result.project_name,
                 len(result.records),
                 review_count,
-                verified_count,
+                matched_count,
                 xlsx_path,
                 review_path,
                 output_directory,
@@ -442,7 +437,7 @@ class ConverterApp:
         project_name: str,
         record_count: int,
         review_count: int,
-        verified_count: int,
+        matched_count: int,
         xlsx_path: Path,
         review_path: Path,
         output_directory: Path,
@@ -460,7 +455,7 @@ class ConverterApp:
         date_note = "原本" if price_date_source == "SOURCE" else "PC日付"
         self.result_var.set(
             f"GAIA取込Excelを作成しました。\n工事名: {project_name}"
-            f"\n明細数: {record_count}行 / レベル4確認済: {verified_count}行"
+            f"\n明細数: {record_count}行 / GAIA実績名称一致: {matched_count}行"
             f"\n積算年月: {price_date:%Y年%m月}（{date_note}）"
             f"{review_text}\nGAIAで選ぶファイル: {xlsx_path}"
         )
@@ -552,9 +547,16 @@ def main() -> int:
                         "review": str(review_path.resolve()),
                         "price_date": price_date.isoformat(),
                         "price_date_source": price_date_source,
-                        "level4_verified": sum(
-                            item.tree_status == "LEVEL4_VERIFIED"
+                        "catalog_path_matched": sum(
+                            item.catalog_path_safe for item in items
+                        ),
+                        "catalog_name_matched": sum(
+                            item.catalog_status.startswith("EXACT")
+                            or item.catalog_status == "FUZZY_PATH"
                             for item in items
+                        ),
+                        "catalog_codes_applied": sum(
+                            bool(item.gaia_code) for item in items
                         ),
                     },
                     ensure_ascii=False,
