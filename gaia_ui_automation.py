@@ -35,6 +35,7 @@ class TrialConfig:
     timeout_seconds: int
     confirm_start: bool
     export_review: bool
+    recognition_only: bool = False
 
 
 def validate_trial_config(config: TrialConfig) -> None:
@@ -76,13 +77,20 @@ def control_texts(window) -> list[str]:
     return texts
 
 
-def wait_for_window(Desktop, required_text: str, timeout: int):
+def wait_for_window(
+    Desktop,
+    required_text: str,
+    timeout: int,
+    process_id: int | None = None,
+):
     deadline = time.monotonic() + timeout
     last_titles: list[str] = []
     while time.monotonic() < deadline:
         for window in Desktop(backend="uia").windows():
             try:
                 if not window.is_visible():
+                    continue
+                if process_id and window.element_info.process_id != process_id:
                     continue
                 texts = control_texts(window)
             except Exception:
@@ -178,7 +186,9 @@ def attach_or_launch(Application, Desktop, executable: Path, timeout: int):
     )
 
 
-def fill_native_gaia_file_dialog(candidate: Path) -> bool:
+def fill_native_gaia_file_dialog(
+    candidate: Path, process_id: int | None = None
+) -> bool:
     """Fill GAIA's classic Win32 file dialog without UIA control discovery."""
     import ctypes
     from ctypes import wintypes
@@ -200,6 +210,8 @@ def fill_native_gaia_file_dialog(candidate: Path) -> bool:
 
     @enum_windows_proc
     def collect_window(hwnd, _):
+        window_process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_process_id))
         length = user32.GetWindowTextLengthW(hwnd)
         title_buffer = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, title_buffer, length + 1)
@@ -209,6 +221,10 @@ def fill_native_gaia_file_dialog(candidate: Path) -> bool:
             class_buffer.value == "#32770"
             and "設計書ファイル" in title_buffer.value
             and user32.IsWindowVisible(hwnd)
+            and (
+                process_id is None
+                or window_process_id.value == process_id
+            )
         ):
             windows.append(hwnd)
         return True
@@ -245,20 +261,21 @@ def fill_native_gaia_file_dialog(candidate: Path) -> bool:
     return True
 
 
-def handle_open_dialog(Desktop, candidate: Path, timeout: int) -> None:
+def handle_open_dialog(
+    Desktop,
+    candidate: Path,
+    timeout: int,
+    process_id: int | None = None,
+) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if fill_native_gaia_file_dialog(candidate):
-            return
-        for window in Desktop(backend="uia").windows():
-            try:
-                if any("金抜き" in text for text in control_texts(window)):
-                    return
-            except Exception:
-                continue
+        if fill_native_gaia_file_dialog(candidate, process_id):
+            return "native_win32"
         for backend in ("uia", "win32"):
             for window in Desktop(backend=backend).windows():
                 try:
+                    if process_id and window.element_info.process_id != process_id:
+                        continue
                     title = window.window_text()
                     if "開く" not in title and "設計書ファイル" not in title:
                         continue
@@ -267,7 +284,7 @@ def handle_open_dialog(Desktop, candidate: Path, timeout: int) -> None:
                         continue
                     edits[-1].set_edit_text(str(candidate.resolve()))
                     click_control(window, "開く")
-                    return
+                    return f"{backend}_controls"
                 except Exception:
                     continue
         time.sleep(0.5)
@@ -339,6 +356,7 @@ def export_review_sheet(
     suffix: str,
     destination: Path,
     config: TrialConfig,
+    process_id: int,
 ) -> None:
     tabs = overview.descendants(control_type="Tab")
     if not tabs:
@@ -347,7 +365,12 @@ def export_review_sheet(
     overview.set_focus()
     before = cache_snapshot(config.cache_root)
     click_control(overview, "Excel出力")
-    print_dialog = wait_for_window(Desktop, "一覧表印刷設定", config.timeout_seconds)
+    print_dialog = wait_for_window(
+        Desktop,
+        "一覧表印刷設定",
+        config.timeout_seconds,
+        process_id,
+    )
     click_control(print_dialog, "Excel出力")
     generated = wait_for_cache_export(
         config.cache_root,
@@ -362,16 +385,24 @@ def export_review_sheet(
 def run_trial(config: TrialConfig) -> dict:
     validate_trial_config(config)
     Application, Desktop = import_pywinauto()
-    attach_or_launch(Application, Desktop, config.gaia_exe, config.timeout_seconds)
+    app = attach_or_launch(
+        Application, Desktop, config.gaia_exe, config.timeout_seconds
+    )
+    process_id = app.process
 
     try:
-        login = wait_for_window(Desktop, "ログイン", min(60, config.timeout_seconds))
+        login = wait_for_window(
+            Desktop,
+            "ログイン",
+            min(60, config.timeout_seconds),
+            process_id,
+        )
         click_control(login, "ログイン")
     except (TimeoutError, LookupError):
         pass
 
     project_window = wait_for_window(
-        Desktop, "設計書取込", config.timeout_seconds
+        Desktop, "設計書取込", config.timeout_seconds, process_id
     )
     capture(project_window, config.output_dir, "01_project_window.png")
     try:
@@ -382,34 +413,59 @@ def run_trial(config: TrialConfig) -> dict:
 
     try:
         # GAIA 11.1 normally opens the Win32 file picker immediately.
-        handle_open_dialog(Desktop, config.candidate, min(15, config.timeout_seconds))
+        dialog_method = handle_open_dialog(
+            Desktop,
+            config.candidate,
+            min(15, config.timeout_seconds),
+            process_id,
+        )
     except TimeoutError:
         # Some installations show an intermediate source-selection form.
         source_window = wait_for_window(
-            Desktop, "参照", config.timeout_seconds
+            Desktop, "参照", config.timeout_seconds, process_id
         )
         click_control(source_window, "参照")
-        handle_open_dialog(Desktop, config.candidate, config.timeout_seconds)
+        dialog_method = handle_open_dialog(
+            Desktop,
+            config.candidate,
+            config.timeout_seconds,
+            process_id,
+        )
 
-    import_window = wait_for_window(Desktop, "金抜き", config.timeout_seconds)
+    import_window = wait_for_window(
+        Desktop, "金抜き", config.timeout_seconds, process_id
+    )
     time.sleep(2)
     capture(import_window, config.output_dir, "02_import_recognition.png")
     texts = control_texts(import_window)
     for expected in ("珠洲市Excel", "珠洲市", "一般土木"):
         if not any(expected in text for text in texts):
             raise RuntimeError(f"GAIA取込認識の確認に失敗しました: {expected}")
+    if config.recognition_only:
+        return {
+            "project_name": config.project_name,
+            "candidate": str(config.candidate.resolve()),
+            "recognized": True,
+            "dialog_method": dialog_method,
+            "technical_trial": True,
+        }
     click_control(import_window, "金抜き")
     click_control(import_window, "取込")
 
     try:
         completed = wait_for_window(
-            Desktop, "取込が完了", min(30, config.timeout_seconds)
+            Desktop,
+            "取込が完了",
+            min(30, config.timeout_seconds),
+            process_id,
         )
         click_control(completed, "OK", "閉じる")
     except (TimeoutError, LookupError):
         pass
 
-    wizard = wait_for_window(Desktop, "次へ", config.timeout_seconds)
+    wizard = wait_for_window(
+        Desktop, "次へ", config.timeout_seconds, process_id
+    )
     page = 1
     while page <= 6:
         capture(wizard, config.output_dir, f"03_wizard_{page}.png")
@@ -432,7 +488,7 @@ def run_trial(config: TrialConfig) -> dict:
     click_control(wizard, "開始", "完了")
 
     result_window = wait_for_window(
-        Desktop, "全自動積算", config.timeout_seconds
+        Desktop, "全自動積算", config.timeout_seconds, process_id
     )
     close_button = wait_for_enabled_control(
         result_window, ["閉じる", "OK"], config.timeout_seconds
@@ -449,16 +505,32 @@ def run_trial(config: TrialConfig) -> dict:
     if not config.export_review:
         return result
 
-    estimate_window = wait_for_window(Desktop, "一覧表", config.timeout_seconds)
+    estimate_window = wait_for_window(
+        Desktop, "一覧表", config.timeout_seconds, process_id
+    )
     click_control(estimate_window, "一覧表")
-    overview = wait_for_window(Desktop, "Excel出力", config.timeout_seconds)
+    overview = wait_for_window(
+        Desktop, "Excel出力", config.timeout_seconds, process_id
+    )
     unit_path = config.output_dir / "gaia_confirm_unit_prices.xlsx"
     work_path = config.output_dir / "gaia_confirm_work_types.xlsx"
     export_review_sheet(
-        Desktop, overview, "確認単価", "確認単価", unit_path, config
+        Desktop,
+        overview,
+        "確認単価",
+        "確認単価",
+        unit_path,
+        config,
+        process_id,
     )
     export_review_sheet(
-        Desktop, overview, "確認工種", "確認工種", work_path, config
+        Desktop,
+        overview,
+        "確認工種",
+        "確認工種",
+        work_path,
+        config,
+        process_id,
     )
     review_rows = parse_gaia_review_workbook(unit_path, "unit")
     review_rows.extend(parse_gaia_review_workbook(work_path, "work"))
@@ -488,6 +560,11 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, default=1200)
     parser.add_argument("--confirm-start", action="store_true")
     parser.add_argument("--export-review", action="store_true")
+    parser.add_argument(
+        "--recognition-only",
+        action="store_true",
+        help="取込形式の認識画面まで確認し、工事は作成しません。",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -502,6 +579,7 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
         confirm_start=args.confirm_start or args.dry_run,
         export_review=args.export_review,
+        recognition_only=args.recognition_only,
     )
     validate_trial_config(config)
     if args.dry_run:

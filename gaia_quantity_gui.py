@@ -5,17 +5,36 @@ import os
 import sys
 import threading
 import traceback
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from quantity_extract import write_normalized_csv
+from gaia_converter import (
+    apply_mapping_rules,
+    apply_reference_index,
+    boq_items_from_extraction,
+    build_gaia_candidate,
+    classify_item,
+    detect_estimate_date,
+    load_mapping_rules,
+    load_reference_index,
+    write_review_csv,
+)
 from quantity_extractors import extract_quantity_source
 
 
 APP_TITLE = "GAIA 数量計算書コンバーター"
 SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".pdf"}
+
+
+def resource_path(*parts: str) -> Path:
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return root.joinpath(*parts)
+
+
+def first_existing_path(*paths: Path) -> Path | None:
+    return next((path for path in paths if path.is_file()), None)
 
 
 def available_output_path(directory: Path, stem: str, suffix: str) -> Path:
@@ -26,7 +45,7 @@ def available_output_path(directory: Path, stem: str, suffix: str) -> Path:
     return directory / f"{stem}_{timestamp}{suffix}"
 
 
-def convert_to_review_files(source_path: Path, output_directory: Path):
+def convert_to_gaia_files(source_path: Path, output_directory: Path):
     output_directory.mkdir(parents=True, exist_ok=True)
     work_directory = (
         output_directory / "_OCR確認資料"
@@ -34,16 +53,91 @@ def convert_to_review_files(source_path: Path, output_directory: Path):
         else None
     )
     result = extract_quantity_source(source_path, work_dir=work_directory)
-    csv_path = available_output_path(
-        output_directory, f"{source_path.stem}_確認用", ".csv"
+    items = boq_items_from_extraction(result)
+    price_date, price_date_source = detect_estimate_date(source_path)
+
+    rules_path = first_existing_path(
+        resource_path("mapping_rules.csv"),
+        Path(__file__).resolve().parent / "mapping_rules.csv",
     )
-    json_path = csv_path.with_suffix(".json")
-    write_normalized_csv(csv_path, result.records)
+    apply_mapping_rules(items, load_mapping_rules(rules_path))
+
+    reference_path = first_existing_path(
+        resource_path("references", "suzu_reference_index.json"),
+        resource_path("assets", "suzu_level_tree_index.json"),
+        Path(__file__).resolve().parent
+        / "references"
+        / "suzu_reference_index.json",
+        Path(__file__).resolve().parent
+        / "assets"
+        / "suzu_level_tree_index.json",
+    )
+    reference_index = load_reference_index(reference_path)
+    if reference_index:
+        apply_reference_index(
+            items,
+            reference_index,
+            price_date=price_date,
+            district="珠洲",
+            tree_category="",
+        )
+    for item in items:
+        classify_item(item, reference_index_active=bool(reference_index))
+
+    template_path = first_existing_path(
+        resource_path("assets", "gaia_suzu_7sheet_template.xlsx"),
+        Path(__file__).resolve().parent
+        / "assets"
+        / "gaia_suzu_7sheet_template.xlsx",
+    )
+    if template_path is None:
+        raise FileNotFoundError(
+            "GAIA取込テンプレートがありません。"
+            "assets\\gaia_suzu_7sheet_template.xlsx を確認してください。"
+        )
+
+    xlsx_path = available_output_path(
+        output_directory, f"{source_path.stem}_GAIA取込用", ".xlsx"
+    )
+    review_path = xlsx_path.with_name(f"{xlsx_path.stem}_確認.csv")
+    json_path = xlsx_path.with_name(f"{xlsx_path.stem}_抽出結果.json")
+    write_review_csv(review_path, items)
+    block_count = build_gaia_candidate(
+        template_path=template_path,
+        output_path=xlsx_path,
+        project_name=result.project_name,
+        items=items,
+        location="",
+        work_category="橋梁工事",
+        district="珠洲",
+        price_date=price_date,
+    )
     json_path.write_text(
-        json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "extraction": result.to_dict(),
+                "gaia": {
+                    "output": str(xlsx_path.resolve()),
+                    "review": str(review_path.resolve()),
+                    "template": str(template_path.resolve()),
+                    "reference_index": (
+                        str(reference_path.resolve()) if reference_path else ""
+                    ),
+                    "price_date": price_date.isoformat(),
+                    "price_date_source": price_date_source,
+                    "tree_category": items[0].tree_category if items else "",
+                    "level4_verified": sum(
+                        item.tree_status == "LEVEL4_VERIFIED" for item in items
+                    ),
+                    "output_blocks": block_count,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    return result, csv_path
+    return result, items, xlsx_path, review_path, price_date, price_date_source
 
 
 class ConverterApp:
@@ -58,6 +152,7 @@ class ConverterApp:
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="数量計算書を選択してください。")
         self.result_var = tk.StringVar()
+        self.last_xlsx: Path | None = None
         self.last_csv: Path | None = None
         self.last_output_directory: Path | None = None
 
@@ -75,7 +170,7 @@ class ConverterApp:
         ).pack(anchor="w")
         tk.Label(
             header,
-            text="Excel・PDFの数量総括表を、確認しやすい共通データへ変換します",
+            text="Excel・PDFの数量計算書から、GAIA取込用Excelを作成します",
             bg="#123B4A",
             fg="#D9E6E8",
             font=("Yu Gothic UI", 11),
@@ -140,7 +235,7 @@ class ConverterApp:
 
         self.convert_button = tk.Button(
             content,
-            text="3  変換する",
+            text="3  GAIA取込Excelを作成",
             command=self.start_conversion,
             bg="#C84A2F",
             fg="white",
@@ -182,8 +277,8 @@ class ConverterApp:
         result_buttons.pack(fill="x", pady=(12, 0))
         tk.Button(
             result_buttons,
-            text="確認用CSVを開く",
-            command=self.open_csv,
+            text="GAIA取込Excelを開く",
+            command=self.open_xlsx,
             bg="#1E6B51",
             fg="white",
             activebackground="#185740",
@@ -194,6 +289,19 @@ class ConverterApp:
             pady=9,
             cursor="hand2",
         ).pack(side="left")
+        tk.Button(
+            result_buttons,
+            text="確認表を開く",
+            command=self.open_csv,
+            bg="#FFFFFF",
+            fg="#1E6B51",
+            activebackground="#F4F7F5",
+            font=("Yu Gothic UI", 10, "bold"),
+            relief="flat",
+            padx=16,
+            pady=9,
+            cursor="hand2",
+        ).pack(side="left", padx=(10, 0))
         tk.Button(
             result_buttons,
             text="結果フォルダーを開く",
@@ -211,8 +319,8 @@ class ConverterApp:
         tk.Label(
             content,
             text=(
-                "注意: PDFは埋め込み文字またはOCRから抽出します。名称・規格・単位・数量を、"
-                "必ず原本と照合してください。"
+                "GAIAには「_GAIA取込用.xlsx」を選択してください。CSVは確認用です。"
+                "PDFの名称・規格・単位・数量は、必ず原本と照合してください。"
             ),
             bg="#F3F0E8",
             fg="#6B4B21",
@@ -288,11 +396,21 @@ class ConverterApp:
 
     def _convert_worker(self, source_path: Path, output_directory: Path) -> None:
         try:
-            result, csv_path = convert_to_review_files(
-                source_path, output_directory
-            )
+            (
+                result,
+                items,
+                xlsx_path,
+                review_path,
+                price_date,
+                price_date_source,
+            ) = convert_to_gaia_files(source_path, output_directory)
             review_count = sum(
-                record.extraction_status != "READY" for record in result.records
+                item.extraction_status != "READY"
+                or item.tree_status != "LEVEL4_VERIFIED"
+                for item in items
+            )
+            verified_count = sum(
+                item.tree_status == "LEVEL4_VERIFIED" for item in items
             )
             self.root.after(
                 0,
@@ -300,8 +418,12 @@ class ConverterApp:
                 result.project_name,
                 len(result.records),
                 review_count,
-                csv_path,
+                verified_count,
+                xlsx_path,
+                review_path,
                 output_directory,
+                price_date,
+                price_date_source,
             )
         except Exception as error:
             output_directory.mkdir(parents=True, exist_ok=True)
@@ -319,21 +441,31 @@ class ConverterApp:
         project_name: str,
         record_count: int,
         review_count: int,
-        csv_path: Path,
+        verified_count: int,
+        xlsx_path: Path,
+        review_path: Path,
         output_directory: Path,
+        price_date: date,
+        price_date_source: str,
     ) -> None:
         self._set_busy(False)
-        self.last_csv = csv_path
+        self.last_xlsx = xlsx_path
+        self.last_csv = review_path
         self.last_output_directory = output_directory
         if review_count:
-            review_text = f"\n要確認: {review_count}行（PDF抽出結果を原本と照合）"
+            review_text = f"\n要確認: {review_count}行（確認表を原本と照合）"
         else:
-            review_text = "\n抽出結果: 自動読取り完了"
+            review_text = "\n要確認: なし"
+        date_note = "原本" if price_date_source == "SOURCE" else "PC日付"
         self.result_var.set(
-            f"変換が完了しました。\n工事名: {project_name}\n明細数: {record_count}行"
-            f"{review_text}\n保存先: {csv_path}"
+            f"GAIA取込Excelを作成しました。\n工事名: {project_name}"
+            f"\n明細数: {record_count}行 / レベル4確認済: {verified_count}行"
+            f"\n積算年月: {price_date:%Y年%m月}（{date_note}）"
+            f"{review_text}\nGAIAで選ぶファイル: {xlsx_path}"
         )
-        self.status_var.set("完了しました。確認用CSVをExcelで確認してください。")
+        self.status_var.set(
+            "完了しました。GAIAでは「_GAIA取込用.xlsx」を選択してください。"
+        )
         self.result_frame.pack(fill="x", pady=(14, 0))
 
     def _conversion_failed(self, message: str, error_log: Path) -> None:
@@ -359,6 +491,10 @@ class ConverterApp:
     def open_csv(self) -> None:
         if self.last_csv and self.last_csv.exists():
             os.startfile(self.last_csv)
+
+    def open_xlsx(self) -> None:
+        if self.last_xlsx and self.last_xlsx.exists():
+            os.startfile(self.last_xlsx)
 
     def open_output_directory(self) -> None:
         if self.last_output_directory and self.last_output_directory.exists():
@@ -396,9 +532,14 @@ def main() -> int:
             else source_path.parent / "GAIA変換結果"
         )
         try:
-            result, csv_path = convert_to_review_files(
-                source_path, output_directory
-            )
+            (
+                result,
+                items,
+                xlsx_path,
+                review_path,
+                price_date,
+                price_date_source,
+            ) = convert_to_gaia_files(source_path, output_directory)
             summary_path = output_directory / "batch_summary.json"
             summary_path.write_text(
                 json.dumps(
@@ -406,7 +547,14 @@ def main() -> int:
                         "project_name": result.project_name,
                         "records": len(result.records),
                         "source_format": result.source_format,
-                        "csv": str(csv_path.resolve()),
+                        "xlsx": str(xlsx_path.resolve()),
+                        "review": str(review_path.resolve()),
+                        "price_date": price_date.isoformat(),
+                        "price_date_source": price_date_source,
+                        "level4_verified": sum(
+                            item.tree_status == "LEVEL4_VERIFIED"
+                            for item in items
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,

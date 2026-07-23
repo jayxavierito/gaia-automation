@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)] [string] $NationalPackagePdf,
     [Parameter(Mandatory = $true)] [string] $IshikawaPackageXlsx,
     [Parameter(Mandatory = $true)] [string] $IshikawaPackagePdf,
-    [string] $Output = ".\references\suzu_reference_index.json"
+    [string] $Output = ".\references\suzu_reference_index.json",
+    [string] $CompactTreeOutput = ".\assets\suzu_level_tree_index.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,4 +36,5 @@ foreach ($path in @(
     --national-package-pdf $NationalPackagePdf `
     --ishikawa-package-xlsx $IshikawaPackageXlsx `
     --ishikawa-package-pdf $IshikawaPackagePdf `
-    --output $Output
+    --output $Output `
+    --compact-tree-output $CompactTreeOutput

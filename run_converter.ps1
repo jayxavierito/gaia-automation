@@ -1,14 +1,14 @@
 param(
     [Parameter(Mandatory = $true)] [string] $Source,
-    [Parameter(Mandatory = $true)] [string] $Template,
-    [Parameter(Mandatory = $true)] [string] $PriceDate,
-    [Parameter(Mandatory = $true)] [string] $TreeCategory,
+    [string] $Template = ".\assets\gaia_suzu_7sheet_template.xlsx",
+    [string] $PriceDate = "",
+    [string] $TreeCategory = "",
     [string] $ReferenceIndex = ".\references\suzu_reference_index.json",
     [string] $Rules = ".\mapping_rules.csv",
     [string[]] $CodeHistory = @(),
-    [string] $District = "",
+    [string] $District = "珠洲",
     [string] $Location = "",
-    [string] $WorkCategory = "",
+    [string] $WorkCategory = "橋梁工事",
     [string] $ExtractionWorkDirectory = ".\tmp\quantity-extraction",
     [string] $Output = ".\outputs\GAIA_candidate.xlsx"
 )
@@ -20,8 +20,8 @@ $python = if (Test-Path ".\.venv\Scripts\python.exe") {
     "python"
 }
 
-if ($CodeHistory.Count -eq 0) {
-    $CodeHistory = @($Template)
+if (-not (Test-Path -LiteralPath $ReferenceIndex)) {
+    $ReferenceIndex = ".\assets\suzu_level_tree_index.json"
 }
 
 foreach ($path in @($Source, $Template, $ReferenceIndex, $Rules) + $CodeHistory) {
@@ -30,7 +30,7 @@ foreach ($path in @($Source, $Template, $ReferenceIndex, $Rules) + $CodeHistory)
     }
 }
 
-if ($PriceDate -notmatch "^\d{4}-\d{2}-\d{2}$") {
+if ($PriceDate -and $PriceDate -notmatch "^\d{4}-\d{2}-\d{2}$") {
     throw "PriceDate must use YYYY-MM-DD, for example 2025-10-24."
 }
 
@@ -40,11 +40,16 @@ $converterArgs = @(
     "--template", $Template,
     "--rules", $Rules,
     "--reference-index", $ReferenceIndex,
-    "--tree-category", $TreeCategory,
     "--output", $Output,
-    "--extraction-work-dir", $ExtractionWorkDirectory,
-    "--price-date", $PriceDate
+    "--extraction-work-dir", $ExtractionWorkDirectory
 )
+
+if ($PriceDate) {
+    $converterArgs += @("--price-date", $PriceDate)
+}
+if ($TreeCategory) {
+    $converterArgs += @("--tree-category", $TreeCategory)
+}
 
 foreach ($historyPath in $CodeHistory) {
     $converterArgs += @("--code-history", $historyPath)

@@ -9,11 +9,14 @@ from gaia_converter import (
     GaiaCodeHistoryEntry,
     apply_gaia_code_history,
     apply_reference_index,
+    build_output_blocks,
     classify_item,
     compare_units,
+    detect_estimate_date,
     extract_gaia_code_history,
     extract_boq_items,
     normalize_match_text,
+    resolve_level_tree_paths,
 )
 
 
@@ -329,6 +332,118 @@ class ConverterTests(unittest.TestCase):
         apply_gaia_code_history([item], [entry])
 
         self.assertEqual(item.gaia_code, "")
+
+    def test_unique_level4_path_populates_all_four_tree_levels(self):
+        item = self.make_package_item()
+        item.work_type = "支承工"
+        item.category = ""
+        item.item_name = "ゴム支承"
+        item.gaia_item_name = "ゴム支承"
+        paths = [
+            {
+                "business_category": "道路新設・改築",
+                "level1": "コンクリート橋上部",
+                "level2": "PC橋工",
+                "level3": "支承工",
+                "level4": "ゴム支承",
+                "pages": [171],
+            }
+        ]
+
+        selected = resolve_level_tree_paths(
+            [item], paths, "道路新設・改築"
+        )
+
+        self.assertEqual(selected, "道路新設・改築")
+        self.assertEqual(item.tree_status, "LEVEL4_VERIFIED")
+        self.assertEqual(
+            (
+                item.tree_level1,
+                item.tree_level2,
+                item.tree_level3,
+                item.tree_level4,
+            ),
+            ("コンクリート橋上部", "PC橋工", "支承工", "ゴム支承"),
+        )
+
+    def test_ambiguous_level4_path_is_not_guessed(self):
+        item = self.make_package_item()
+        item.work_type = "支承工"
+        item.category = ""
+        item.item_name = "ゴム支承"
+        item.gaia_item_name = "ゴム支承"
+        paths = [
+            {
+                "business_category": "道路新設・改築",
+                "level1": level1,
+                "level2": level2,
+                "level3": "支承工",
+                "level4": "ゴム支承",
+                "pages": [page],
+            }
+            for level1, level2, page in (
+                ("コンクリート橋上部", "PC橋工", 171),
+                ("鋼橋上部", "鋼橋架設工", 165),
+            )
+        ]
+
+        resolve_level_tree_paths([item], paths, "道路新設・改築")
+
+        self.assertEqual(item.tree_status, "LEVEL4_AMBIGUOUS_PATH")
+        self.assertEqual(item.tree_level1, "")
+        blocks = build_output_blocks([item])
+        self.assertEqual(blocks[0].value, item.section)
+        self.assertEqual(blocks[2].value, "種別未確認")
+
+    def test_unique_level4_name_requires_compatible_upper_context(self):
+        item = self.make_package_item()
+        item.work_type = "橋台工"
+        item.category = "躯体工"
+        item.item_name = "転落防止柵"
+        item.gaia_item_name = "転落防止柵"
+        paths = [
+            {
+                "business_category": "道路新設・改築",
+                "level1": "道路改良",
+                "level2": "構造物撤去工",
+                "level3": "防護柵撤去工",
+                "level4": "防護柵(横断・転落防止柵)",
+                "pages": [150],
+            }
+        ]
+
+        resolve_level_tree_paths([item], paths, "道路新設・改築")
+
+        self.assertEqual(item.tree_status, "LEVEL4_AMBIGUOUS_PATH")
+        self.assertEqual(item.tree_level1, "")
+
+    def test_detects_estimate_month_next_to_excel_label(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "積算年月"
+        sheet["B1"] = "令和8年6月"
+        path = Path.cwd() / "test_estimate_date.xlsx"
+        try:
+            workbook.save(path)
+            detected, source = detect_estimate_date(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertEqual(detected, date(2026, 6, 1))
+        self.assertEqual(source, "SOURCE")
+
+    def test_missing_estimate_month_uses_pc_date(self):
+        workbook = Workbook()
+        workbook.active["A1"] = "数量計算書"
+        path = Path.cwd() / "test_no_estimate_date.xlsx"
+        try:
+            workbook.save(path)
+            detected, source = detect_estimate_date(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertEqual(detected, date.today())
+        self.assertEqual(source, "PC_DATE")
 
 
 if __name__ == "__main__":

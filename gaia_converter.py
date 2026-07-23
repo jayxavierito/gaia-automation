@@ -5,8 +5,9 @@ import csv
 import json
 import re
 import unicodedata
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
@@ -14,13 +15,28 @@ from typing import Iterable
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.worksheet import Worksheet
+from pypdf import PdfReader
 
-from quantity_extractors import extract_quantity_source
+from quantity_extractors import ExtractionResult, extract_quantity_source
 
 
 BLANK_VALUES = {"", "-", "―"}
 SOURCE_YEAR_RE = re.compile(r"(?:令和|R)\s*(\d+)", re.IGNORECASE)
 GAIA_CODE_RE = re.compile(r"^\[([A-Z]{2}\d{6})\]$")
+ESTIMATE_DATE_LABELS = (
+    "積算年月",
+    "単価適用年月",
+    "歩掛単価適用年月",
+    "歩掛り単価適用年月",
+    "単価年月",
+)
+ERA_YEAR_MONTH_RE = re.compile(
+    r"(?:令和|R)\s*(\d{1,2})\s*(?:年|[./-])?\s*(\d{1,2})\s*月?",
+    re.IGNORECASE,
+)
+WESTERN_YEAR_MONTH_RE = re.compile(
+    r"\b(20\d{2})\s*(?:年|[./-])\s*(\d{1,2})\s*月?"
+)
 
 
 @dataclass
@@ -77,6 +93,11 @@ class BoqItem:
     tree_category: str = ""
     tree_status: str = ""
     tree_pages: str = ""
+    tree_level1: str = ""
+    tree_level2: str = ""
+    tree_level3: str = ""
+    tree_level4: str = ""
+    tree_match_score: float = 0.0
     guideline_status: str = ""
     guideline_pages: str = ""
     package_match_type: str = ""
@@ -153,6 +174,66 @@ def fiscal_year_for_date(value: date) -> int:
     return value.year if value.month >= 4 else value.year - 1
 
 
+def _year_month_from_value(value: object) -> date | None:
+    if isinstance(value, datetime):
+        return date(value.year, value.month, 1)
+    if isinstance(value, date):
+        return date(value.year, value.month, 1)
+    text = clean_text(value)
+    if not text:
+        return None
+    match = ERA_YEAR_MONTH_RE.search(text)
+    if match:
+        return date(2018 + int(match.group(1)), int(match.group(2)), 1)
+    match = WESTERN_YEAR_MONTH_RE.search(text)
+    if match:
+        return date(int(match.group(1)), int(match.group(2)), 1)
+    return None
+
+
+def detect_estimate_date(source_path: Path) -> tuple[date, str]:
+    suffix = source_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm"}:
+        workbook = load_workbook(
+            source_path,
+            data_only=True,
+            read_only=True,
+        )
+        try:
+            for sheet in workbook.worksheets:
+                max_row = min(sheet.max_row, 150)
+                max_column = min(sheet.max_column, 40)
+                for row in sheet.iter_rows(
+                    min_row=1,
+                    max_row=max_row,
+                    min_col=1,
+                    max_col=max_column,
+                    values_only=True,
+                ):
+                    for column, value in enumerate(row):
+                        text = clean_text(value)
+                        if not any(label in text for label in ESTIMATE_DATE_LABELS):
+                            continue
+                        for candidate in row[column : column + 5]:
+                            detected = _year_month_from_value(candidate)
+                            if detected:
+                                return detected, "SOURCE"
+        finally:
+            workbook.close()
+    elif suffix == ".pdf":
+        reader = PdfReader(source_path)
+        text = "\n".join(
+            page.extract_text() or "" for page in reader.pages[:15]
+        )
+        for line in text.splitlines():
+            if not any(label in line for label in ESTIMATE_DATE_LABELS):
+                continue
+            detected = _year_month_from_value(line)
+            if detected:
+                return detected, "SOURCE"
+    return date.today(), "PC_DATE"
+
+
 def append_warning(item: BoqItem, message: str) -> None:
     cleaned = clean_text(message)
     if cleaned and cleaned not in item.warnings:
@@ -171,10 +252,7 @@ def combine_unique(*values: str) -> str:
     return " / ".join(result)
 
 
-def extract_boq_items(
-    source_path: Path, work_dir: Path | None = None
-) -> tuple[str, list[BoqItem]]:
-    extraction = extract_quantity_source(source_path, work_dir=work_dir)
+def boq_items_from_extraction(extraction: ExtractionResult) -> list[BoqItem]:
     items: list[BoqItem] = []
     for record in extraction.records:
         item = BoqItem(
@@ -207,6 +285,14 @@ def extract_boq_items(
         for warning in item.extraction_warnings:
             append_warning(item, warning)
         items.append(item)
+    return items
+
+
+def extract_boq_items(
+    source_path: Path, work_dir: Path | None = None
+) -> tuple[str, list[BoqItem]]:
+    extraction = extract_quantity_source(source_path, work_dir=work_dir)
+    items = boq_items_from_extraction(extraction)
     return extraction.project_name, items
 
 
@@ -398,6 +484,255 @@ def page_matches(
     return "ITEM_FOUND", ",".join(str(page) for page in found_pages[:10])
 
 
+def _tree_similarity(left: object, right: object) -> float:
+    left_key = normalize_match_text(left)
+    right_key = normalize_match_text(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key == right_key:
+        return 1.0
+    if (
+        min(len(left_key), len(right_key)) >= 3
+        and (left_key in right_key or right_key in left_key)
+    ):
+        return 0.9
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _tree_item_names(item: BoqItem) -> list[str]:
+    return list(
+        dict.fromkeys(
+            value
+            for value in (
+                item.item_name,
+                item.gaia_item_name,
+                item.package_name,
+            )
+            if clean_text(value)
+        )
+    )
+
+
+def _tree_context_names(item: BoqItem) -> list[str]:
+    return list(
+        dict.fromkeys(
+            value
+            for value in (item.category, item.work_type, item.section)
+            if clean_text(value)
+        )
+    )
+
+
+def infer_tree_category(items: Iterable[BoqItem], paths: list[dict]) -> str:
+    scores: dict[str, float] = defaultdict(float)
+    for item in items:
+        item_names = _tree_item_names(item)
+        context_names = _tree_context_names(item)
+        per_category: dict[str, float] = defaultdict(float)
+        for path in paths:
+            category = clean_text(path.get("business_category"))
+            if not category:
+                continue
+            level4_score = max(
+                (_tree_similarity(name, path.get("level4")) for name in item_names),
+                default=0.0,
+            )
+            level3_score = max(
+                (
+                    _tree_similarity(context, path.get("level3"))
+                    for context in context_names
+                ),
+                default=0.0,
+            )
+            score = 0.0
+            if level4_score >= 0.9:
+                score += 2.0
+            if level3_score >= 0.9:
+                score += 3.0
+            if level4_score >= 0.9 and level3_score >= 0.75:
+                score += 2.0
+            per_category[category] = max(per_category[category], score)
+        for category, score in per_category.items():
+            scores[category] += score
+    if not scores:
+        return ""
+    ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+    if ranked[0][1] <= 0:
+        return ""
+    return ranked[0][0]
+
+
+def resolve_level_tree_paths(
+    items: list[BoqItem],
+    paths: list[dict],
+    tree_category: str,
+) -> str:
+    selected_category = clean_text(tree_category) or infer_tree_category(items, paths)
+    branch_paths = [
+        path
+        for path in paths
+        if normalize_match_text(path.get("business_category"))
+        == normalize_match_text(selected_category)
+    ]
+    if not branch_paths:
+        for item in items:
+            item.tree_category = selected_category
+            item.tree_status = "NOT_FOUND"
+        return selected_category
+
+    for item in items:
+        item.tree_category = selected_category
+        item.tree_level4 = clean_text(item.gaia_item_name or item.item_name)
+        item_names = _tree_item_names(item)
+        context_names = _tree_context_names(item)
+
+        scored: list[tuple[float, float, float, dict]] = []
+        for path in branch_paths:
+            level4_score = max(
+                (_tree_similarity(name, path.get("level4")) for name in item_names),
+                default=0.0,
+            )
+            if level4_score < 0.9:
+                continue
+            level3_score = max(
+                (
+                    _tree_similarity(context, path.get("level3"))
+                    for context in context_names
+                ),
+                default=0.0,
+            )
+            level2_score = max(
+                (
+                    _tree_similarity(context, path.get("level2"))
+                    for context in context_names
+                ),
+                default=0.0,
+            )
+            scored.append(
+                (
+                    level4_score * 2
+                    + level3_score * 3
+                    + level2_score,
+                    level3_score,
+                    level2_score,
+                    path,
+                )
+            )
+
+        if scored:
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+            all_hierarchies = {
+                (
+                    clean_text(path.get("level1")),
+                    clean_text(path.get("level2")),
+                    clean_text(path.get("level3")),
+                    clean_text(path.get("level4")),
+                )
+                for _, _, _, path in scored
+            }
+            if len(all_hierarchies) == 1:
+                eligible = [
+                    candidate
+                    for candidate in scored
+                    if not context_names
+                    or candidate[1] >= 0.75
+                    or candidate[2] >= 0.9
+                ]
+            else:
+                eligible = [
+                    candidate
+                    for candidate in scored
+                    if candidate[1] >= 0.75 and candidate[2] >= 0.9
+                ]
+            best_score, _, _, best_path = eligible[0] if eligible else scored[0]
+            tied_paths = [
+                path
+                for score, _, _, path in eligible
+                if abs(score - best_score) < 0.05
+            ]
+            tied_hierarchies = {
+                (
+                    clean_text(path.get("level1")),
+                    clean_text(path.get("level2")),
+                    clean_text(path.get("level3")),
+                    clean_text(path.get("level4")),
+                )
+                for path in tied_paths
+            }
+            if eligible and len(tied_hierarchies) == 1:
+                item.tree_level1 = clean_text(best_path.get("level1"))
+                item.tree_level2 = clean_text(best_path.get("level2"))
+                item.tree_level3 = clean_text(best_path.get("level3"))
+                item.tree_level4 = clean_text(best_path.get("level4"))
+                item.tree_pages = ",".join(
+                    str(page) for page in best_path.get("pages", [])[:10]
+                )
+                item.tree_match_score = round(best_score, 3)
+                item.tree_status = "LEVEL4_VERIFIED"
+                continue
+
+        context_paths: list[tuple[float, dict]] = []
+        for path in branch_paths:
+            level3_score = max(
+                (
+                    _tree_similarity(context, path.get("level3"))
+                    for context in context_names
+                ),
+                default=0.0,
+            )
+            if level3_score < 0.9:
+                continue
+            context_paths.append((level3_score, path))
+        if context_paths:
+            context_paths.sort(key=lambda pair: pair[0], reverse=True)
+            best_score, best_path = context_paths[0]
+            best_hierarchy = (
+                clean_text(best_path.get("level1")),
+                clean_text(best_path.get("level2")),
+                clean_text(best_path.get("level3")),
+            )
+            tied_hierarchies = {
+                (
+                    clean_text(path.get("level1")),
+                    clean_text(path.get("level2")),
+                    clean_text(path.get("level3")),
+                )
+                for score, path in context_paths
+                if abs(score - best_score) < 0.05
+            }
+            if len(tied_hierarchies) == 1:
+                item.tree_level1, item.tree_level2, item.tree_level3 = best_hierarchy
+                item.tree_pages = ",".join(
+                    str(page) for page in best_path.get("pages", [])[:10]
+                )
+                item.tree_match_score = round(best_score, 3)
+                item.tree_status = "LEVEL3_VERIFIED_LEVEL4_UNVERIFIED"
+                append_warning(
+                    item,
+                    "積算体系ツリーでレベル3までは確認できましたが、"
+                    "レベル4細別は原文のまま要確認です",
+                )
+                continue
+
+        if scored:
+            item.tree_status = "LEVEL4_AMBIGUOUS_PATH"
+            append_warning(
+                item,
+                "レベル4名称は積算体系ツリーにありますが、"
+                "上位区分が複数あるため自動確定していません",
+            )
+        elif context_paths:
+            item.tree_status = "LEVEL3_AMBIGUOUS_PATH"
+            append_warning(
+                item,
+                "レベル3名称は積算体系ツリーにありますが、"
+                "上位区分が複数あるため自動確定していません",
+            )
+        else:
+            item.tree_status = "NOT_FOUND"
+    return selected_category
+
+
 def guideline_matches(
     pages: list[dict], item_keys: list[str], context_keys: list[str]
 ) -> tuple[str, str]:
@@ -431,6 +766,7 @@ def apply_reference_index(
     district: str,
     tree_category: str,
 ) -> None:
+    item_list = list(items)
     packages = [
         package
         for package in index.get("package_catalog", [])
@@ -441,7 +777,13 @@ def apply_reference_index(
         packages_by_name.setdefault(package.get("search_name", ""), []).append(package)
 
     all_tree_pages = index.get("level_tree", {}).get("pages", [])
-    normalized_tree_category = normalize_match_text(tree_category)
+    tree_paths = index.get("level_tree", {}).get("paths", [])
+    selected_tree_category = (
+        resolve_level_tree_paths(item_list, tree_paths, tree_category)
+        if tree_paths
+        else clean_text(tree_category)
+    )
+    normalized_tree_category = normalize_match_text(selected_tree_category)
     tree_pages = (
         [
             page
@@ -454,8 +796,8 @@ def apply_reference_index(
     )
     guideline_pages = index.get("quantity_guideline", {}).get("pages", [])
 
-    for item in items:
-        item.tree_category = clean_text(tree_category)
+    for item in item_list:
+        item.tree_category = selected_tree_category
         item.source_standard_year = source_fiscal_year(item.standard)
         item_keys = list(
             dict.fromkeys(
@@ -512,9 +854,10 @@ def apply_reference_index(
                     f"{candidate.get('name')}"
                     for candidate in best_candidates[:5]
                 )
-                item.tree_status, item.tree_pages = page_matches(
-                    tree_pages, item_keys, context_keys
-                )
+                if not item.tree_status:
+                    item.tree_status, item.tree_pages = page_matches(
+                        tree_pages, item_keys, context_keys
+                    )
                 item.guideline_status, item.guideline_pages = guideline_matches(
                     guideline_pages, item_keys, context_keys
                 )
@@ -603,9 +946,10 @@ def apply_reference_index(
             else:
                 item.package_match_type = "NOT_FOUND"
 
-        item.tree_status, item.tree_pages = page_matches(
-            tree_pages, item_keys, context_keys
-        )
+        if not item.tree_status:
+            item.tree_status, item.tree_pages = page_matches(
+                tree_pages, item_keys, context_keys
+            )
         item.guideline_status, item.guideline_pages = guideline_matches(
             guideline_pages, item_keys, context_keys
         )
@@ -690,7 +1034,13 @@ def classify_item(item: BoqItem, *, reference_index_active: bool = False) -> Non
         elif not item.tree_category:
             item.match_status = "TREE_BRANCH_REVIEW"
             item.confidence = 0.5
-        elif item.tree_status == "NOT_FOUND":
+        elif item.tree_status in {
+            "NOT_FOUND",
+            "LEVEL2_PROJECT_CONTEXT",
+            "LEVEL3_VERIFIED_LEVEL4_UNVERIFIED",
+            "LEVEL3_AMBIGUOUS_PATH",
+            "LEVEL4_AMBIGUOUS_PATH",
+        }:
             item.match_status = "TREE_REVIEW"
             item.confidence = 0.55
         elif item.guideline_status == "NOT_FOUND":
@@ -765,19 +1115,27 @@ def build_output_blocks(items: Iterable[BoqItem]) -> list[OutputBlock]:
     for item in items:
         if item.match_status == "INVALID_QUANTITY":
             continue
-        if item.section != previous_section:
-            blocks.append(OutputBlock("fee", item.section, "費目行"))
-            previous_section = item.section
+        section = clean_text(item.tree_level1 or item.section) or "工事区分未確認"
+        work_type = clean_text(item.tree_level2 or item.work_type) or "工種未確認"
+        category = clean_text(
+            item.tree_level3 or item.category
+        ) or "種別未確認"
+        item_name = clean_text(
+            item.tree_level4 or item.gaia_item_name or item.item_name
+        )
+        if section != previous_section:
+            blocks.append(OutputBlock("fee", section, "レベル1 工事区分"))
+            previous_section = section
             previous_work_type = ""
             previous_category = ""
-        if item.work_type and item.work_type != previous_work_type:
-            blocks.append(OutputBlock("work", item.work_type, "工種行"))
-            previous_work_type = item.work_type
+        if work_type != previous_work_type:
+            blocks.append(OutputBlock("work", work_type, "レベル2 工種"))
+            previous_work_type = work_type
             previous_category = ""
-        if item.category and item.category != previous_category:
-            blocks.append(OutputBlock("category", item.category, "種別行"))
-            previous_category = item.category
-        blocks.append(OutputBlock("item", item.gaia_item_name, item=item))
+        if category != previous_category:
+            blocks.append(OutputBlock("category", category, "レベル3 種別"))
+            previous_category = category
+        blocks.append(OutputBlock("item", item_name, item=item))
     return blocks
 
 
@@ -915,6 +1273,11 @@ def write_review_csv(path: Path, items: list[BoqItem]) -> None:
         "tree_category",
         "tree_status",
         "tree_pages",
+        "tree_level1",
+        "tree_level2",
+        "tree_level3",
+        "tree_level4",
+        "tree_match_score",
         "guideline_status",
         "guideline_pages",
         "package_match_type",
@@ -983,7 +1346,11 @@ def main() -> int:
     parser.add_argument("--location", default="")
     parser.add_argument("--work-category", default="橋梁工事")
     parser.add_argument("--district", default="珠洲")
-    parser.add_argument("--price-date", default="", help="YYYY-MM-DD")
+    parser.add_argument(
+        "--price-date",
+        default="",
+        help="YYYY-MM-DD。省略時は原本から検出し、無ければPC日付を使用します。",
+    )
     args = parser.parse_args()
 
     project_name, items = extract_boq_items(
@@ -991,7 +1358,11 @@ def main() -> int:
     )
     if args.project_name:
         project_name = clean_text(args.project_name)
-    price_date = parse_iso_date(args.price_date)
+    if args.price_date:
+        price_date = parse_iso_date(args.price_date)
+        price_date_source = "USER"
+    else:
+        price_date, price_date_source = detect_estimate_date(args.source)
     rules = load_mapping_rules(args.rules)
     apply_mapping_rules(items, rules)
     reference_index = load_reference_index(args.reference_index)
@@ -1050,8 +1421,9 @@ def main() -> int:
         "history_codes_applied": sum(
             item.matched_rule.startswith("GAIA_HISTORY:") for item in items
         ),
-        "price_date": price_date.isoformat() if price_date else "",
-        "tree_category": clean_text(args.tree_category),
+        "price_date": price_date.isoformat(),
+        "price_date_source": price_date_source,
+        "tree_category": items[0].tree_category if items else clean_text(args.tree_category),
         "output": str(args.output.resolve()),
         "review": str(review_path.resolve()),
     }

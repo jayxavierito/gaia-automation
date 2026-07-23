@@ -22,10 +22,18 @@ $arguments = @(
     "--noupx",
     "--name", $Name,
     "--add-data", "windows_ocr.ps1;.",
+    "--add-data", "mapping_rules.csv;.",
+    "--add-data", "assets;assets",
     "--collect-all", "pypdfium2",
-    "--collect-all", "pdfplumber",
-    ".\gaia_quantity_gui.py"
+    "--collect-all", "pdfplumber"
 )
+if (Test-Path -LiteralPath ".\references\suzu_reference_index.json") {
+    $arguments += @(
+        "--add-data",
+        "references\suzu_reference_index.json;references"
+    )
+}
+$arguments += ".\gaia_quantity_gui.py"
 
 & $python @arguments
 if ($LASTEXITCODE -ne 0) {

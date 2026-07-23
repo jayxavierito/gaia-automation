@@ -12,11 +12,17 @@ from typing import Any
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
 
 PACKAGE_TITLE_RE = re.compile(r"No\.\s*(\d+)\s*【\s*(.*?)\s*】")
 PACKAGE_UNIT_RE = re.compile(r"積算単位\s*[:：]\s*([^\s>＞]+)")
 FISCAL_YEAR_RE = re.compile(r"(?:令和|R)\s*(\d+)\s*年度", re.IGNORECASE)
 EFFECTIVE_DATE_RE = re.compile(r"令和\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日")
+TREE_CATEGORY_RE = re.compile(r"事業区分\s*[:：]\s*([^】\]\r\n]+)")
 
 
 def clean_text(value: object) -> str:
@@ -99,6 +105,155 @@ def read_pdf_pages(path: Path) -> tuple[list[dict[str, Any]], str]:
             }
         )
     return pages, first_page_text
+
+
+def _tree_level_for_x(x0: float, page_width: float) -> int | None:
+    ratio = x0 / page_width
+    if 0.02 <= ratio < 0.135:
+        return 1
+    if ratio < 0.25:
+        return 2
+    if ratio < 0.365:
+        return 3
+    if ratio < 0.48:
+        return 4
+    if ratio < 0.63:
+        return 5
+    return None
+
+
+def _tree_page_category(text: str) -> str:
+    match = TREE_CATEGORY_RE.search(text)
+    return clean_text(match.group(1)) if match else ""
+
+
+def _balanced_tree_label(value: str) -> bool:
+    pairs = (("(", ")"), ("【", "】"), ("[", "]"))
+    for opening, closing in pairs:
+        balance = 0
+        for character in value:
+            if character == opening:
+                balance += 1
+            elif character == closing:
+                balance -= 1
+            if balance < 0:
+                return False
+        if balance:
+            return False
+    return True
+
+
+def _tree_page_events(page) -> list[tuple[float, int, str]]:
+    grouped: list[dict[str, Any]] = []
+    for word in page.extract_words(
+        x_tolerance=1,
+        y_tolerance=2,
+        use_text_flow=False,
+        keep_blank_chars=False,
+    ):
+        top = float(word["top"])
+        if top < 75 or top > float(page.height) - 8:
+            continue
+        level = _tree_level_for_x(float(word["x0"]), float(page.width))
+        if level is None:
+            continue
+        text = clean_text(word["text"])
+        if not text:
+            continue
+        existing = next(
+            (
+                entry
+                for entry in grouped
+                if entry["level"] == level and abs(entry["top"] - top) <= 1.5
+            ),
+            None,
+        )
+        if existing is None:
+            grouped.append({"top": top, "level": level, "parts": [text]})
+        else:
+            existing["parts"].append(text)
+
+    events = [
+        (entry["top"], entry["level"], "".join(entry["parts"]))
+        for entry in grouped
+    ]
+    events.sort(key=lambda event: (event[0], event[1]))
+
+    merged: list[tuple[float, int, str]] = []
+    for top, level, text in events:
+        previous_has_open_pair = bool(
+            merged
+            and (
+                merged[-1][2].count("(") > merged[-1][2].count(")")
+                or merged[-1][2].count("【") > merged[-1][2].count("】")
+            )
+        )
+        if (
+            merged
+            and level == merged[-1][1]
+            and top - merged[-1][0] <= 10
+            and (text in {"工", "等", "費", "部"} or previous_has_open_pair)
+        ):
+            previous_top, previous_level, previous_text = merged[-1]
+            merged[-1] = (
+                previous_top,
+                previous_level,
+                previous_text + text,
+            )
+            continue
+        merged.append((top, level, text))
+    return merged
+
+
+def parse_level_tree_paths(path: Path) -> list[dict[str, Any]]:
+    if pdfplumber is None:
+        return []
+
+    current_category = ""
+    current_levels = {level: "" for level in range(1, 6)}
+    by_path: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    with pdfplumber.open(path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            page_category = _tree_page_category(page_text)
+            if page_category and page_category != current_category:
+                current_category = page_category
+                current_levels = {level: "" for level in range(1, 6)}
+
+            for _, level, value in _tree_page_events(page):
+                current_levels[level] = value
+                for deeper_level in range(level + 1, 6):
+                    current_levels[deeper_level] = ""
+                if (
+                    level != 4
+                    or not current_category
+                    or len(current_levels[4]) < 2
+                ):
+                    continue
+
+                key = (
+                    current_category,
+                    current_levels[1],
+                    current_levels[2],
+                    current_levels[3],
+                    current_levels[4],
+                )
+                if not all(key) or not all(
+                    _balanced_tree_label(value) for value in key
+                ):
+                    continue
+                if key not in by_path:
+                    by_path[key] = {
+                        "business_category": current_category,
+                        "level1": current_levels[1],
+                        "level2": current_levels[2],
+                        "level3": current_levels[3],
+                        "level4": current_levels[4],
+                        "pages": [page_number],
+                    }
+                elif page_number not in by_path[key]["pages"]:
+                    by_path[key]["pages"].append(page_number)
+    return list(by_path.values())
 
 
 def package_condition_fields(sheet) -> list[str]:
@@ -272,6 +427,7 @@ def enrich_current_packages(
 
 def build_index(args: argparse.Namespace) -> dict[str, Any]:
     level_pages, _ = read_pdf_pages(args.level_tree)
+    level_paths = parse_level_tree_paths(args.level_tree)
     guideline_pages, guideline_first = read_pdf_pages(args.quantity_guideline)
 
     national_schema = parse_package_workbook(
@@ -327,6 +483,8 @@ def build_index(args: argparse.Namespace) -> dict[str, Any]:
         "level_tree": {
             "pages": level_pages,
             "page_count": len(level_pages),
+            "paths": level_paths,
+            "path_count": len(level_paths),
         },
         "quantity_guideline": {
             "pages": guideline_pages,
@@ -349,6 +507,11 @@ def main() -> int:
     parser.add_argument("--ishikawa-package-xlsx", required=True, type=Path)
     parser.add_argument("--ishikawa-package-pdf", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--compact-tree-output",
+        type=Path,
+        help="Portable版向けに積算体系ツリーのレベル1～4だけを保存します。",
+    )
     args = parser.parse_args()
 
     index = build_index(args)
@@ -356,6 +519,25 @@ def main() -> int:
     args.output.write_text(
         json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if args.compact_tree_output:
+        compact_index = {
+            "schema_version": 1,
+            "generated_at": index["generated_at"],
+            "sources": {},
+            "level_tree": {
+                "pages": [],
+                "page_count": index["level_tree"]["page_count"],
+                "paths": index["level_tree"]["paths"],
+                "path_count": index["level_tree"]["path_count"],
+            },
+            "quantity_guideline": {"pages": [], "page_count": 0},
+            "package_catalog": [],
+        }
+        args.compact_tree_output.parent.mkdir(parents=True, exist_ok=True)
+        args.compact_tree_output.write_text(
+            json.dumps(compact_index, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
     summary = {
         "output": str(args.output.resolve()),
         "level_tree_pages": index["level_tree"]["page_count"],
