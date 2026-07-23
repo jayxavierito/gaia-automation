@@ -169,8 +169,39 @@ class ConverterApp:
             font=("Yu Gothic UI", 11),
         ).pack(anchor="w", pady=(6, 0))
 
-        content = tk.Frame(self.root, bg="#F3F0E8", padx=34, pady=26)
-        content.pack(fill="both", expand=True)
+        scroll_host = tk.Frame(self.root, bg="#F3F0E8")
+        scroll_host.pack(fill="both", expand=True)
+        self.content_canvas = tk.Canvas(
+            scroll_host,
+            bg="#F3F0E8",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.content_scrollbar = tk.Scrollbar(
+            scroll_host,
+            orient="vertical",
+            command=self.content_canvas.yview,
+        )
+        self.content_canvas.configure(
+            yscrollcommand=self.content_scrollbar.set,
+        )
+        self.content_scrollbar.pack(side="right", fill="y")
+        self.content_canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(
+            self.content_canvas,
+            bg="#F3F0E8",
+            padx=34,
+            pady=26,
+        )
+        self.content_window = self.content_canvas.create_window(
+            (0, 0),
+            window=content,
+            anchor="nw",
+        )
+        content.bind("<Configure>", self._update_scroll_region)
+        self.content_canvas.bind("<Configure>", self._resize_scroll_content)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
 
         self._section_label(content, "1  数量計算書を選ぶ")
         source_row = tk.Frame(content, bg="#F3F0E8")
@@ -309,7 +340,7 @@ class ConverterApp:
             cursor="hand2",
         ).pack(side="left", padx=(10, 0))
 
-        tk.Label(
+        self.help_label = tk.Label(
             content,
             text=(
                 "GAIAには「_GAIA取込用.xlsx」を選択してください。CSVは確認用です。"
@@ -321,7 +352,28 @@ class ConverterApp:
             justify="left",
             anchor="w",
             wraplength=750,
-        ).pack(fill="x", pady=(18, 0))
+        )
+        self.help_label.pack(fill="x", pady=(18, 0))
+
+    def _update_scroll_region(self, _event: tk.Event | None = None) -> None:
+        bounds = self.content_canvas.bbox("all")
+        if bounds:
+            self.content_canvas.configure(scrollregion=bounds)
+
+    def _resize_scroll_content(self, event: tk.Event) -> None:
+        self.content_canvas.itemconfigure(
+            self.content_window,
+            width=event.width,
+        )
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        if event.delta == 0:
+            return "break"
+        steps = -int(event.delta / 120)
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
+        self.content_canvas.yview_scroll(steps, "units")
+        return "break"
 
     @staticmethod
     def _section_label(parent: tk.Widget, text: str) -> None:
@@ -462,7 +514,16 @@ class ConverterApp:
         self.status_var.set(
             "完了しました。GAIAでは「_GAIA取込用.xlsx」を選択してください。"
         )
-        self.result_frame.pack(fill="x", pady=(14, 0))
+        self.result_frame.pack(
+            fill="x",
+            pady=(14, 0),
+            before=self.help_label,
+        )
+        self.root.after_idle(self._show_completed_result)
+
+    def _show_completed_result(self) -> None:
+        self._update_scroll_region()
+        self.content_canvas.yview_moveto(1.0)
 
     def _conversion_failed(self, message: str, error_log: Path) -> None:
         self._set_busy(False)
@@ -501,9 +562,23 @@ def main() -> int:
     if len(sys.argv) >= 3 and sys.argv[1] == "--gui-smoke-test":
         report_path = Path(sys.argv[2])
         root = tk.Tk()
-        ConverterApp(root)
+        app = ConverterApp(root)
         root.update_idletasks()
         root.update()
+        app._conversion_succeeded(
+            "UI確認",
+            47,
+            43,
+            15,
+            Path("UI確認_GAIA取込用.xlsx"),
+            Path("UI確認_GAIA取込用_確認.csv"),
+            report_path.parent,
+            date.today(),
+            "PC_DATE",
+        )
+        root.update_idletasks()
+        root.update()
+        bounds = app.content_canvas.bbox("all")
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(
             json.dumps(
@@ -511,6 +586,16 @@ def main() -> int:
                     "title": root.title(),
                     "geometry": root.geometry(),
                     "state": root.state(),
+                    "scrollbar_orientation": app.content_scrollbar.cget(
+                        "orient"
+                    ),
+                    "scroll_region": app.content_canvas.cget("scrollregion"),
+                    "canvas_height": app.content_canvas.winfo_height(),
+                    "content_height": bounds[3] - bounds[1] if bounds else 0,
+                    "vertical_view": app.content_canvas.yview(),
+                    "result_visible": bool(
+                        app.result_frame.winfo_ismapped()
+                    ),
                 },
                 ensure_ascii=False,
                 indent=2,
