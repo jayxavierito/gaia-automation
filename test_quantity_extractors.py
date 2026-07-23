@@ -15,6 +15,7 @@ from quantity_extractors import (
     _records_from_pdf_rows,
     _records_from_pdf_vector_table,
     extract_excel_quantity_source,
+    parse_quantity,
 )
 
 
@@ -50,6 +51,31 @@ class QuantityExtractorTests(unittest.TestCase):
         self.assertEqual(result.records[1].item_name, "左官工法")
         self.assertEqual(result.records[1].specification, "別規格")
         self.assertEqual(result.records[1].quantity, 0.3)
+
+    def test_summary_section_prefix_does_not_replace_project_name(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "数量総括"
+        sheet["B1"] = "§1.数量総括表　　　　　　仮谷橋　数量総括表"
+        headers = ["工種", "種別", "細別", "規格等", "単位", "数量"]
+        for column, value in enumerate(headers, start=2):
+            sheet.cell(3, column).value = value
+        values = ["1. 下部工補修工", "断面修復工", "左官工法", "", "m3", 0.1]
+        for column, value in enumerate(values, start=2):
+            sheet.cell(4, column).value = value
+
+        path = Path.cwd() / "test_103_仮谷橋_数量計算書.xlsx"
+        try:
+            workbook.save(path)
+            result = extract_excel_quantity_source(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertEqual(result.project_name, "仮谷橋")
+
+    def test_quantity_rounds_excel_binary_noise(self):
+        self.assertEqual(parse_quantity(15.379999999999999), 15.38)
+        self.assertEqual(parse_quantity(0.7999999999999999), 0.8)
 
     def test_pdf_rows_use_standard_columns_and_require_review(self):
         rows = [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -26,6 +27,12 @@ except ImportError:  # The OCR fallback remains usable in minimal installations.
 LEGACY_SUMMARY_RE = re.compile(r"^設計数量総括表[（(](.+?)[）)]$")
 PROJECT_LABEL_RE = re.compile(r"設計書名\s*[:：]\s*(.+)")
 JAPANESE_CHARACTERS = r"一-龯々ぁ-ゖァ-ヺー"
+STRUCTURAL_SUMMARY_PREFIX_RE = re.compile(
+    r"^\s*§\s*\d+(?:[.-]\d+)*[.．]?\s*(?:設計)?数量総括表\s*"
+)
+STRUCTURAL_PROJECT_NAME_RE = re.compile(
+    r"^(?:§\s*\d+(?:[.-]\d+)*[.．]?|(?:設計)?数量(?:総括表|計算書)|目次)$"
+)
 
 
 class QuantityExtractionError(RuntimeError):
@@ -141,6 +148,10 @@ def parse_quantity(value: object) -> float | int | None:
         if not match:
             return None
         number = float(text)
+    if not math.isfinite(number):
+        return None
+    # Formula caches can expose binary tails such as 15.379999999999999.
+    number = round(number, 12)
     return int(number) if number.is_integer() else number
 
 
@@ -250,6 +261,29 @@ def _project_from_filename(path: Path) -> str:
     return name.strip(" _-－") or "数量計算書変換工事"
 
 
+def _project_from_summary_title(value: object) -> str:
+    text = clean_label(value)
+    if not text:
+        return ""
+    match = PROJECT_LABEL_RE.search(text)
+    if match:
+        candidate = clean_text(match.group(1))
+    else:
+        legacy = re.fullmatch(r"(?:設計)?数量総括表[（(](.+?)[）)]", text)
+        if legacy:
+            candidate = clean_text(legacy.group(1))
+        else:
+            if "数量総括表" not in text:
+                return ""
+            candidate = STRUCTURAL_SUMMARY_PREFIX_RE.sub("", text)
+            candidate = re.sub(
+                r"\s*(?:設計)?数量総括表\s*$", "", candidate
+            ).strip()
+    if not candidate or STRUCTURAL_PROJECT_NAME_RE.fullmatch(candidate):
+        return ""
+    return candidate
+
+
 def _extract_excel_project_name(
     workbook, selected: list[_ExcelTableCandidate], source_path: Path
 ) -> str:
@@ -257,14 +291,11 @@ def _extract_excel_project_name(
         sheet = workbook[candidate.sheet_name]
         for row in range(1, min(candidate.header_row, 15) + 1):
             for column in range(1, min(sheet.max_column, 15) + 1):
-                value = clean_label(sheet.cell(row, column).value)
-                match = PROJECT_LABEL_RE.search(value)
-                if match:
-                    return clean_text(match.group(1))
-                if "数量総括表" in value:
-                    title = re.sub(r"(?:設計)?数量総括表.*$", "", value).strip()
-                    if title:
-                        return title
+                project_name = _project_from_summary_title(
+                    sheet.cell(row, column).value
+                )
+                if project_name:
+                    return project_name
     return _project_from_filename(source_path)
 
 

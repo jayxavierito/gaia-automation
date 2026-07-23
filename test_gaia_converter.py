@@ -16,6 +16,7 @@ from gaia_converter import (
     extract_gaia_code_history,
     extract_boq_items,
     normalize_match_text,
+    normalize_hierarchy_label,
     resolve_level_tree_paths,
 )
 
@@ -113,6 +114,12 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(items[0].work_type, "舗装工")
         self.assertEqual(items[0].category, "舗装工")
         self.assertEqual(items[0].source_reference, "P.1442")
+
+    def test_hierarchy_sequence_prefix_is_removed_without_touching_names(self):
+        self.assertEqual(
+            normalize_hierarchy_label("1. 下部工補修工"), "下部工補修工"
+        )
+        self.assertEqual(normalize_hierarchy_label("1号橋補修工"), "1号橋補修工")
 
     def test_explicit_not_applicable_is_blocked(self):
         item = BoqItem(
@@ -394,6 +401,53 @@ class ConverterTests(unittest.TestCase):
         blocks = build_output_blocks([item])
         self.assertEqual(blocks[0].value, item.section)
         self.assertEqual(blocks[2].value, "種別未確認")
+
+    def test_bridge_project_selects_unique_maintenance_branch(self):
+        item = self.make_package_item()
+        item.work_type = "下部工補修工"
+        item.category = "断面修復工"
+        item.item_name = "左官工法"
+        item.gaia_item_name = "左官工法"
+        paths = [
+            {
+                "business_category": "道路維持・修繕",
+                "level1": level1,
+                "level2": level2,
+                "level3": "断面修復工",
+                "level4": "左官工法",
+                "pages": [page],
+            }
+            for level1, level2, page in (
+                ("道路修繕", "橋梁補修工", 256),
+                ("道路修繕", "構造物補修工", 257),
+                ("橋梁保全工事", "橋梁補修工", 276),
+            )
+        ]
+
+        resolve_level_tree_paths(
+            [item],
+            paths,
+            "道路維持・修繕",
+            project_name="仮谷橋",
+        )
+
+        self.assertEqual(item.tree_status, "LEVEL4_VERIFIED")
+        self.assertEqual(
+            (item.tree_level1, item.tree_level2, item.tree_level3),
+            ("橋梁保全工事", "橋梁補修工", "断面修復工"),
+        )
+
+        unmatched = self.make_package_item()
+        unmatched.item_name = "現地固有細別"
+        unmatched.gaia_item_name = "現地固有細別"
+        resolve_level_tree_paths(
+            [unmatched],
+            paths,
+            "道路維持・修繕",
+            project_name="仮谷橋",
+        )
+        self.assertEqual(unmatched.tree_status, "NOT_FOUND")
+        self.assertEqual(unmatched.tree_level1, "橋梁保全工事")
 
     def test_unique_level4_name_requires_compatible_upper_context(self):
         item = self.make_package_item()

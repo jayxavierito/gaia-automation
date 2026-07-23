@@ -80,6 +80,7 @@ def convert_to_gaia_files(source_path: Path, output_directory: Path):
             price_date=price_date,
             district="珠洲",
             tree_category="",
+            project_name=result.project_name,
         )
     for item in items:
         classify_item(item, reference_index_active=bool(reference_index))

@@ -37,6 +37,23 @@ ERA_YEAR_MONTH_RE = re.compile(
 WESTERN_YEAR_MONTH_RE = re.compile(
     r"\b(20\d{2})\s*(?:年|[./-])\s*(\d{1,2})\s*月?"
 )
+HIERARCHY_NUMBER_PREFIX_RES = (
+    re.compile(r"^\s*[（(]\s*\d+(?:[.-]\d+)*\s*[）)]\s*"),
+    re.compile(r"^\s*(?:§\s*)?\d+(?:[.-]\d+)*[.．、:：)]\s*"),
+    re.compile(r"^\s*\d+\s+(?=\S)"),
+)
+BRIDGE_CONTEXT_TERMS = (
+    "橋",
+    "橋梁",
+    "橋台",
+    "橋脚",
+    "胸壁",
+    "地覆",
+    "伸縮装置",
+    "支承",
+    "床版",
+    "主桁",
+)
 
 
 @dataclass
@@ -124,6 +141,15 @@ def clean_text(value: object) -> str:
         return ""
     text = unicodedata.normalize("NFKC", str(value))
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_hierarchy_label(value: object) -> str:
+    text = clean_text(value)
+    for pattern in HIERARCHY_NUMBER_PREFIX_RES:
+        cleaned = pattern.sub("", text)
+        if cleaned != text:
+            return cleaned.strip()
+    return text
 
 
 def normalize_match_text(value: object) -> str:
@@ -258,9 +284,9 @@ def boq_items_from_extraction(extraction: ExtractionResult) -> list[BoqItem]:
         item = BoqItem(
             source_sheet=record.source_sheet,
             source_row=record.source_row,
-            section=record.section,
-            work_type=record.work_type,
-            category=record.category,
+            section=normalize_hierarchy_label(record.section),
+            work_type=normalize_hierarchy_label(record.work_type),
+            category=normalize_hierarchy_label(record.category),
             item_name=record.item_name,
             specification=record.specification,
             unit=record.unit,
@@ -562,10 +588,47 @@ def infer_tree_category(items: Iterable[BoqItem], paths: list[dict]) -> str:
     return ranked[0][0]
 
 
+def infer_preferred_tree_level1(
+    items: Iterable[BoqItem],
+    paths: list[dict],
+    tree_category: str,
+    project_name: str,
+) -> str:
+    category_key = normalize_match_text(tree_category)
+    level1_names = {
+        clean_text(path.get("level1"))
+        for path in paths
+        if normalize_match_text(path.get("business_category")) == category_key
+        and clean_text(path.get("level1"))
+    }
+    bridge_level1_names = {
+        name for name in level1_names if "橋梁" in normalize_match_text(name)
+    }
+    if len(bridge_level1_names) != 1:
+        return ""
+
+    project_text = clean_text(project_name)
+    if "橋" in project_text or "橋梁" in project_text:
+        return next(iter(bridge_level1_names))
+
+    bridge_evidence = 0
+    for item in items:
+        context = combine_unique(
+            item.section,
+            item.work_type,
+            item.category,
+            item.item_name,
+        )
+        if any(term in context for term in BRIDGE_CONTEXT_TERMS):
+            bridge_evidence += 1
+    return next(iter(bridge_level1_names)) if bridge_evidence >= 3 else ""
+
+
 def resolve_level_tree_paths(
     items: list[BoqItem],
     paths: list[dict],
     tree_category: str,
+    project_name: str = "",
 ) -> str:
     selected_category = clean_text(tree_category) or infer_tree_category(items, paths)
     branch_paths = [
@@ -579,15 +642,28 @@ def resolve_level_tree_paths(
             item.tree_category = selected_category
             item.tree_status = "NOT_FOUND"
         return selected_category
+    preferred_level1 = infer_preferred_tree_level1(
+        items, paths, selected_category, project_name
+    )
+    resolution_paths = (
+        [
+            path
+            for path in branch_paths
+            if clean_text(path.get("level1")) == preferred_level1
+        ]
+        if preferred_level1
+        else branch_paths
+    )
 
     for item in items:
         item.tree_category = selected_category
+        item.tree_level1 = preferred_level1
         item.tree_level4 = clean_text(item.gaia_item_name or item.item_name)
         item_names = _tree_item_names(item)
         context_names = _tree_context_names(item)
 
         scored: list[tuple[float, float, float, dict]] = []
-        for path in branch_paths:
+        for path in resolution_paths:
             level4_score = max(
                 (_tree_similarity(name, path.get("level4")) for name in item_names),
                 default=0.0,
@@ -642,7 +718,8 @@ def resolve_level_tree_paths(
                 eligible = [
                     candidate
                     for candidate in scored
-                    if candidate[1] >= 0.75 and candidate[2] >= 0.9
+                    if candidate[1] >= 0.75
+                    and (candidate[2] >= 0.9 or preferred_level1)
                 ]
             best_score, _, _, best_path = eligible[0] if eligible else scored[0]
             tied_paths = [
@@ -672,7 +749,7 @@ def resolve_level_tree_paths(
                 continue
 
         context_paths: list[tuple[float, dict]] = []
-        for path in branch_paths:
+        for path in resolution_paths:
             level3_score = max(
                 (
                     _tree_similarity(context, path.get("level3"))
@@ -765,6 +842,7 @@ def apply_reference_index(
     price_date: date | None,
     district: str,
     tree_category: str,
+    project_name: str = "",
 ) -> None:
     item_list = list(items)
     packages = [
@@ -779,7 +857,9 @@ def apply_reference_index(
     all_tree_pages = index.get("level_tree", {}).get("pages", [])
     tree_paths = index.get("level_tree", {}).get("paths", [])
     selected_tree_category = (
-        resolve_level_tree_paths(item_list, tree_paths, tree_category)
+        resolve_level_tree_paths(
+            item_list, tree_paths, tree_category, project_name=project_name
+        )
         if tree_paths
         else clean_text(tree_category)
     )
@@ -1373,6 +1453,7 @@ def main() -> int:
             price_date=price_date,
             district=clean_text(args.district),
             tree_category=clean_text(args.tree_category),
+            project_name=project_name,
         )
     for item in items:
         classify_item(item, reference_index_active=bool(reference_index))
