@@ -69,8 +69,6 @@ def expected_source_fields(row: dict[str, str]) -> tuple[str, str, str]:
     name = row.get("gaia_item_name") or row.get("item_name") or ""
     specification = row.get("gaia_condition") or row.get("specification") or ""
     unit = row.get("unit") or ""
-    if row.get("package_unit_status") == "EQUIVALENT" and row.get("package_unit"):
-        unit = row["package_unit"]
     return name, specification, unit
 
 

@@ -4,78 +4,24 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from gaia_catalog import GaiaCatalogEntry
 from gaia_converter import (
     BoqItem,
-    GaiaCodeHistoryEntry,
-    apply_gaia_code_history,
-    apply_reference_index,
+    apply_gaia_catalog,
+    build_gaia_candidate,
     build_output_blocks,
-    classify_item,
-    compare_units,
+    classify_schema_item,
     detect_estimate_date,
-    extract_gaia_code_history,
     extract_boq_items,
-    normalize_match_text,
+    infer_work_category,
     normalize_hierarchy_label,
-    resolve_level_tree_paths,
+    normalize_match_text,
 )
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 
 class ConverterTests(unittest.TestCase):
-    def make_package_item(self, standard="R8_国土交通省土木工事積算基準"):
-        return BoqItem(
-            source_sheet="設計数量総括表(下部工)",
-            source_row=10,
-            section="下部工",
-            work_type="舗装工",
-            category="アスファルト舗装工",
-            item_name="表層(車道・路肩部)",
-            specification="再生密粒度アスコン t=6cm",
-            unit="m2",
-            quantity=100,
-            remarks="",
-            standard=standard,
-            daily_output="2300m2",
-            setting="3.0m超,t=6cm,再生密粒度アスコン(20F),無し",
-            notes="",
-            source_reference="P.1442",
-            gaia_item_name="表層(車道・路肩部)",
-        )
-
-    def make_reference_index(self):
-        item_key = normalize_match_text("表層(車道・路肩部)")
-        category_key = normalize_match_text("アスファルト舗装工")
-        return {
-            "schema_version": 1,
-            "level_tree": {
-                "pages": [
-                    {
-                        "page": 20,
-                        "heading": "積算体系ツリー 河川改修",
-                        "search_text": f"{category_key}{item_key}",
-                    }
-                ]
-            },
-            "quantity_guideline": {
-                "pages": [{"page": 300, "search_text": item_key}]
-            },
-            "package_catalog": [
-                {
-                    "package_no": "018",
-                    "name": "表層(車道・路肩部)",
-                    "search_name": item_key,
-                    "unit": "m2",
-                    "condition_fields": ["施工幅員", "舗装厚", "材料規格"],
-                    "source_kind": "ISHIKAWA_DISASTER_PACKAGE",
-                    "source_page": "018-1～7",
-                    "fiscal_year": 2026,
-                    "effective_from": "2026-04-01",
-                    "scope": "石川県中能登・奥能登地域(珠洲市を含む)",
-                    "priority": 300,
-                }
-            ],
-        }
-
     def test_extracts_two_row_summary_item(self):
         workbook = Workbook()
         sheet = workbook.active
@@ -121,73 +67,6 @@ class ConverterTests(unittest.TestCase):
         )
         self.assertEqual(normalize_hierarchy_label("1号橋補修工"), "1号橋補修工")
 
-    def test_explicit_not_applicable_is_blocked(self):
-        item = BoqItem(
-            source_sheet="設計数量総括表(上部工)",
-            source_row=10,
-            section="上部工",
-            work_type="RC橋工",
-            category="支承工",
-            item_name="ゴム支承設置工",
-            specification="帯状ゴム支承",
-            unit="式",
-            quantity=1,
-            remarks="",
-            standard="見積り",
-            daily_output="(該当なし)",
-            setting="―",
-            notes="積算基準に記載が無いため、適用不可",
-            source_reference="",
-        )
-        classify_item(item)
-        self.assertEqual(item.match_status, "BLOCKED_REVIEW")
-        self.assertEqual(item.confidence, 0.0)
-
-    def test_current_ishikawa_package_is_exact_but_not_a_gaia_code(self):
-        item = self.make_package_item()
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-
-        self.assertEqual(item.match_status, "PACKAGE_EXACT")
-        self.assertEqual(item.package_source, "ISHIKAWA_DISASTER_PACKAGE")
-        self.assertEqual(item.package_no, "018")
-        self.assertEqual(item.package_unit_status, "MATCH")
-        self.assertEqual(item.gaia_code, "")
-
-    def test_missing_price_date_blocks_package_confirmation(self):
-        item = self.make_package_item()
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=None,
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-
-        self.assertEqual(item.reference_date_status, "MISSING_PRICE_DATE")
-        self.assertEqual(item.match_status, "PACKAGE_DATE_REVIEW")
-
-    def test_source_standard_year_mismatch_is_reviewed(self):
-        item = self.make_package_item(standard="R7_国土交通省土木工事積算基準")
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-
-        self.assertEqual(item.source_standard_status, "YEAR_MISMATCH")
-        self.assertEqual(item.match_status, "PACKAGE_YEAR_REVIEW")
-
     def test_trailing_work_suffix_and_tsumikomi_are_normalized(self):
         self.assertEqual(
             normalize_match_text("排水管設置工"),
@@ -197,279 +76,6 @@ class ConverterTests(unittest.TestCase):
             normalize_match_text("積込み(コンクリート殻)"),
             normalize_match_text("積込(コンクリート殻)"),
         )
-        self.assertEqual(compare_units("孔", "箇所"), "EQUIVALENT")
-        self.assertEqual(compare_units("掛m2", "m2"), "EQUIVALENT")
-
-    def test_duplicate_current_package_names_are_not_auto_selected(self):
-        item = self.make_package_item()
-        item.item_name = "コンクリート工"
-        item.gaia_item_name = "コンクリート工"
-        item.setting = "無筋・鉄筋構造物、ポンプ車打設"
-        index = self.make_reference_index()
-        key = normalize_match_text("コンクリート")
-        index["package_catalog"] = [
-            {
-                **index["package_catalog"][0],
-                "package_no": package_no,
-                "name": "コンクリート",
-                "search_name": key,
-                "source_kind": "NATIONAL_PACKAGE_PDF",
-                "priority": 200,
-            }
-            for package_no in ("157", "333")
-        ]
-        apply_reference_index(
-            [item],
-            index,
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-
-        self.assertEqual(item.package_match_type, "AMBIGUOUS_EXACT_NAME")
-        self.assertEqual(item.match_status, "MANUAL_REVIEW")
-        self.assertEqual(item.package_no, "")
-
-    def test_extracts_and_applies_unambiguous_gaia_code_history(self):
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.title = "本工事費内訳表"
-        sheet["E4"] = "表層(車道・路肩部)"
-        sheet["J4"] = "m2"
-        sheet["M4"] = "[CB410260]"
-        sheet["D5"] = "3.0m超 60mm"
-        path = Path.cwd() / "test_history.xlsx"
-        try:
-            workbook.save(path)
-            entries = extract_gaia_code_history(path)
-        finally:
-            path.unlink(missing_ok=True)
-
-        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-        apply_gaia_code_history([item], entries)
-        classify_item(item, reference_index_active=True)
-
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(item.gaia_code, "CB410260")
-        self.assertEqual(item.match_status, "EXACT_CODE")
-        self.assertTrue(item.matched_rule.startswith("GAIA_HISTORY:"))
-
-    def test_history_code_is_not_applied_when_codes_are_ambiguous(self):
-        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-        entries = [
-            GaiaCodeHistoryEntry(
-                code=code,
-                name="表層(車道・路肩部)",
-                condition="",
-                unit="m2",
-                source_file="history.xlsx",
-                source_sheet="本工事費内訳表",
-                source_row=row,
-            )
-            for code, row in (("CB410260", 4), ("CB410240", 8))
-        ]
-
-        apply_gaia_code_history([item], entries)
-
-        self.assertEqual(item.gaia_code, "")
-        self.assertEqual(item.match_status, "PACKAGE_EXACT")
-
-    def test_history_code_does_not_override_quotation_review(self):
-        item = self.make_package_item(standard="見積り")
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-        entry = GaiaCodeHistoryEntry(
-            code="CB410260",
-            name="表層(車道・路肩部)",
-            condition="",
-            unit="m2",
-            source_file="history.xlsx",
-            source_sheet="本工事費内訳表",
-            source_row=4,
-        )
-
-        apply_gaia_code_history([item], [entry])
-
-        self.assertEqual(item.gaia_code, "")
-        self.assertEqual(item.match_status, "QUOTATION_REQUIRED")
-
-    def test_history_code_requires_unit_evidence(self):
-        item = self.make_package_item(standard="R8_国土交通省土木工事積算基準")
-        apply_reference_index(
-            [item],
-            self.make_reference_index(),
-            price_date=date(2026, 7, 1),
-            district="珠洲",
-            tree_category="河川改修",
-        )
-        classify_item(item, reference_index_active=True)
-        entry = GaiaCodeHistoryEntry(
-            code="CB410260",
-            name="表層(車道・路肩部)",
-            condition="",
-            unit="",
-            source_file="history.xlsx",
-            source_sheet="本工事費内訳表",
-            source_row=4,
-        )
-
-        apply_gaia_code_history([item], [entry])
-
-        self.assertEqual(item.gaia_code, "")
-
-    def test_unique_level4_path_populates_all_four_tree_levels(self):
-        item = self.make_package_item()
-        item.work_type = "支承工"
-        item.category = ""
-        item.item_name = "ゴム支承"
-        item.gaia_item_name = "ゴム支承"
-        paths = [
-            {
-                "business_category": "道路新設・改築",
-                "level1": "コンクリート橋上部",
-                "level2": "PC橋工",
-                "level3": "支承工",
-                "level4": "ゴム支承",
-                "pages": [171],
-            }
-        ]
-
-        selected = resolve_level_tree_paths(
-            [item], paths, "道路新設・改築"
-        )
-
-        self.assertEqual(selected, "道路新設・改築")
-        self.assertEqual(item.tree_status, "LEVEL4_VERIFIED")
-        self.assertEqual(
-            (
-                item.tree_level1,
-                item.tree_level2,
-                item.tree_level3,
-                item.tree_level4,
-            ),
-            ("コンクリート橋上部", "PC橋工", "支承工", "ゴム支承"),
-        )
-
-    def test_ambiguous_level4_path_is_not_guessed(self):
-        item = self.make_package_item()
-        item.work_type = "支承工"
-        item.category = ""
-        item.item_name = "ゴム支承"
-        item.gaia_item_name = "ゴム支承"
-        paths = [
-            {
-                "business_category": "道路新設・改築",
-                "level1": level1,
-                "level2": level2,
-                "level3": "支承工",
-                "level4": "ゴム支承",
-                "pages": [page],
-            }
-            for level1, level2, page in (
-                ("コンクリート橋上部", "PC橋工", 171),
-                ("鋼橋上部", "鋼橋架設工", 165),
-            )
-        ]
-
-        resolve_level_tree_paths([item], paths, "道路新設・改築")
-
-        self.assertEqual(item.tree_status, "LEVEL4_AMBIGUOUS_PATH")
-        self.assertEqual(item.tree_level1, "")
-        blocks = build_output_blocks([item])
-        self.assertEqual(blocks[0].value, item.section)
-        self.assertEqual(blocks[2].value, "種別未確認")
-
-    def test_bridge_project_selects_unique_maintenance_branch(self):
-        item = self.make_package_item()
-        item.work_type = "下部工補修工"
-        item.category = "断面修復工"
-        item.item_name = "左官工法"
-        item.gaia_item_name = "左官工法"
-        paths = [
-            {
-                "business_category": "道路維持・修繕",
-                "level1": level1,
-                "level2": level2,
-                "level3": "断面修復工",
-                "level4": "左官工法",
-                "pages": [page],
-            }
-            for level1, level2, page in (
-                ("道路修繕", "橋梁補修工", 256),
-                ("道路修繕", "構造物補修工", 257),
-                ("橋梁保全工事", "橋梁補修工", 276),
-            )
-        ]
-
-        resolve_level_tree_paths(
-            [item],
-            paths,
-            "道路維持・修繕",
-            project_name="仮谷橋",
-        )
-
-        self.assertEqual(item.tree_status, "LEVEL4_VERIFIED")
-        self.assertEqual(
-            (item.tree_level1, item.tree_level2, item.tree_level3),
-            ("橋梁保全工事", "橋梁補修工", "断面修復工"),
-        )
-
-        unmatched = self.make_package_item()
-        unmatched.item_name = "現地固有細別"
-        unmatched.gaia_item_name = "現地固有細別"
-        resolve_level_tree_paths(
-            [unmatched],
-            paths,
-            "道路維持・修繕",
-            project_name="仮谷橋",
-        )
-        self.assertEqual(unmatched.tree_status, "NOT_FOUND")
-        self.assertEqual(unmatched.tree_level1, "橋梁保全工事")
-
-    def test_unique_level4_name_requires_compatible_upper_context(self):
-        item = self.make_package_item()
-        item.work_type = "橋台工"
-        item.category = "躯体工"
-        item.item_name = "転落防止柵"
-        item.gaia_item_name = "転落防止柵"
-        paths = [
-            {
-                "business_category": "道路新設・改築",
-                "level1": "道路改良",
-                "level2": "構造物撤去工",
-                "level3": "防護柵撤去工",
-                "level4": "防護柵(横断・転落防止柵)",
-                "pages": [150],
-            }
-        ]
-
-        resolve_level_tree_paths([item], paths, "道路新設・改築")
-
-        self.assertEqual(item.tree_status, "LEVEL4_AMBIGUOUS_PATH")
-        self.assertEqual(item.tree_level1, "")
 
     def test_detects_estimate_month_next_to_excel_label(self):
         workbook = Workbook()
@@ -498,6 +104,101 @@ class ConverterTests(unittest.TestCase):
 
         self.assertEqual(detected, date.today())
         self.assertEqual(source, "PC_DATE")
+
+    def _make_item(self, **overrides) -> BoqItem:
+        fields = dict(
+            source_sheet="数量総括",
+            source_row=4,
+            section="本工事費",
+            work_type="舗装工",
+            category="舗装打換え工",
+            item_name="表層",
+            specification="再生密粒度アスコン t=5cm",
+            unit="m2",
+            quantity=100,
+            remarks="",
+            standard="",
+            daily_output="",
+            setting="",
+            notes="",
+            source_reference="",
+        )
+        fields.update(overrides)
+        return BoqItem(**fields)
+
+    def test_invalid_quantity_item_is_excluded_from_output_blocks(self):
+        zero_quantity_item = self._make_item(quantity=0)
+        apply_gaia_catalog([zero_quantity_item], [])
+        classify_schema_item(zero_quantity_item)
+
+        self.assertEqual(zero_quantity_item.match_status, "INVALID_QUANTITY")
+        self.assertEqual(build_output_blocks([zero_quantity_item]), [])
+
+    def test_source_review_required_item_never_receives_a_code_even_with_exact_catalog_match(
+        self,
+    ):
+        entry = GaiaCatalogEntry(
+            level1="本工事費",
+            level2="舗装工",
+            level3="舗装打換え工",
+            item_name="表層",
+            specification="再生密粒度アスコン t=5cm",
+            unit="m2",
+            code="CB410260",
+            source_file="accepted.xlsx",
+            source_row=16,
+        )
+        item = self._make_item(extraction_status="SOURCE_REVIEW_REQUIRED")
+        apply_gaia_catalog([item], [entry])
+        classify_schema_item(item)
+
+        self.assertEqual(item.match_status, "SOURCE_REVIEW_REQUIRED")
+        self.assertEqual(item.gaia_code, "")
+
+    def test_infer_work_category_uses_project_name_and_item_keywords(self):
+        bridge_item = self._make_item(
+            work_type="橋台工", category="躯体工", item_name="床版工"
+        )
+        self.assertEqual(
+            infer_work_category("〇〇橋補修工事", [bridge_item]), "橋梁工事"
+        )
+
+    def test_build_gaia_candidate_writes_hierarchy_into_shipped_template(self):
+        template_path = ASSETS_DIR / "gaia_suzu_7sheet_template.xlsx"
+        if not template_path.exists():
+            self.skipTest("shipped GAIA template is not present in this checkout")
+
+        item = self._make_item()
+        apply_gaia_catalog([item], [])
+        classify_schema_item(item)
+
+        output_path = Path.cwd() / "test_gaia_candidate.xlsx"
+        try:
+            block_count = build_gaia_candidate(
+                template_path=template_path,
+                output_path=output_path,
+                project_name="テスト工事",
+                items=[item],
+                location="テスト地内",
+                work_category="道路工事",
+                district="珠洲",
+                price_date=date(2026, 4, 1),
+            )
+            self.assertEqual(block_count, 4)  # fee + work + category + item rows
+
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(output_path)
+            try:
+                main_sheet = workbook["本工事費内訳表"]
+                self.assertEqual(main_sheet["D16"].value, "表層")
+                self.assertEqual(main_sheet["H16"].value, 100)
+                self.assertEqual(main_sheet["J16"].value, "m2")
+                self.assertEqual(workbook["鏡"]["D6"].value, "テスト工事")
+            finally:
+                workbook.close()
+        finally:
+            output_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
