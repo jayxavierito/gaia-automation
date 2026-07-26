@@ -112,9 +112,9 @@ HEADER_ALIASES = {
     "unit": {"単位"},
     "quantity": {"数量", "設計数量", "合計数量"},
     "remarks": {"備考", "摘要"},
-    "standard": {"積算基準", "適用基準", "基準"},
-    "daily_output": {"日当り施工量", "日施工量"},
-    "setting": {"設定", "施工条件", "条件"},
+    "standard": {"積算基準", "適用基準", "基準", "適用積算基準"},
+    "daily_output": {"日当り施工量", "日施工量", "日当たり施工量"},
+    "setting": {"設定", "施工条件", "条件", "設定内容"},
     "notes": {"注記", "注意事項", "特記事項"},
     "source_reference": {"参照", "参照頁", "根拠頁", "出典"},
 }
@@ -358,6 +358,36 @@ def _with_legacy_columns(
     return columns
 
 
+def _is_repeated_header_block_row(
+    sheet: Worksheet, row: int, columns: dict[str, int]
+) -> bool:
+    """Detect page-break title/header rows repeated mid-sheet.
+
+    Long summary sheets restate the sheet title, project name, and column
+    headers every printed page (e.g. every 40 rows). Those restated rows sit
+    in the same columns as real data and would otherwise be read as a new
+    hierarchy value (e.g. work_type becoming the literal text "工種"),
+    silently corrupting the running section/work_type/category state for
+    every row that follows until the next explicit value.
+    """
+    title_cell = clean_text(sheet.cell(row, 1).value)
+    if title_cell and ("総括表" in title_cell or "数量計算書" in title_cell):
+        return True
+    if title_cell and PROJECT_LABEL_RE.search(title_cell):
+        return True
+
+    checked = 0
+    matched = 0
+    for column in columns.values():
+        value = sheet.cell(row, column).value
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        checked += 1
+        if _header_role(value):
+            matched += 1
+    return checked >= 2 and matched / checked >= 0.6
+
+
 def _extract_excel_table(
     sheet: Worksheet, candidate: _ExcelTableCandidate
 ) -> list[QuantityRecord]:
@@ -375,6 +405,8 @@ def _extract_excel_table(
 
     for row in range(candidate.header_row + 1, sheet.max_row + 1):
         if row in consumed_quantity_rows:
+            continue
+        if _is_repeated_header_block_row(sheet, row, columns):
             continue
         explicit = {
             role: _text_cell(_excel_value(sheet, row, columns, role))

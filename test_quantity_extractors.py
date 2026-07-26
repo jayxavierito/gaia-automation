@@ -52,6 +52,42 @@ class QuantityExtractorTests(unittest.TestCase):
         self.assertEqual(result.records[1].specification, "別規格")
         self.assertEqual(result.records[1].quantity, 0.3)
 
+    def test_repeated_page_header_does_not_corrupt_hierarchy(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "設計数量総括表(下部工)"
+        sheet["A1"] = "設計数量総括表"
+        sheet["A2"] = "設計書名：珠洲市橋梁災害(舟山橋)"
+        headers = ["工　種", "種　別", "細　別", "規　　格", "単位", "数　量", "摘　　要"]
+        for column, value in enumerate(headers, start=1):
+            sheet.cell(5, column).value = value
+        # A work-type header row with no item on the same line, as in a real
+        # 数量計算書 where the items live on the next printed page.
+        sheet["A6"] = "橋台工"
+        # Page break: the title/project-name/header block repeats mid-sheet.
+        sheet["A9"] = "設計数量総括表"
+        sheet["A10"] = "設計書名：珠洲市橋梁災害(舟山橋)"
+        for column, value in enumerate(headers, start=1):
+            sheet.cell(13, column).value = value
+        sheet["B14"] = "作業土工"
+        sheet["C15"] = "床掘り"
+        sheet["D15"] = "土砂,小規模"
+        sheet["E15"] = "m3"
+        sheet["F15"] = 19.1
+
+        path = Path.cwd() / "test_舟山橋_数量計算書.xlsx"
+        try:
+            workbook.save(path)
+            result = extract_excel_quantity_source(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertEqual(len(result.records), 1)
+        record = result.records[0]
+        self.assertEqual(record.work_type, "橋台工")
+        self.assertEqual(record.category, "作業土工")
+        self.assertEqual(record.item_name, "床掘り")
+
     def test_summary_section_prefix_does_not_replace_project_name(self):
         workbook = Workbook()
         sheet = workbook.active
