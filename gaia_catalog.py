@@ -17,7 +17,10 @@ HIERARCHY_MARKERS = {
     "費目行": ("level1", 0),
     "工種行": ("level2", 1),
     "種別行": ("level3", 2),
+    "細別行": ("level4", 3),
+    "規格行": ("level5", 4),
 }
+HIERARCHY_ROLES = ("level1", "level2", "level3", "level4", "level5")
 MATCH_PUNCTUATION_RE = re.compile(
     r"[\s・･()（）「」【】\[\]{}｛｝/／,，.。:：;；"
     r"‐‑‒–—―ーｰ\-_'\"“”‘’]"
@@ -102,6 +105,11 @@ class GaiaCatalogEntry:
     code: str
     source_file: str
     source_row: int
+    level4: str = ""
+    level5: str = ""
+    item_column: int = 4
+    reference_type: str = ""
+    reference_text: str = ""
 
     @classmethod
     def from_dict(cls, value: dict) -> "GaiaCatalogEntry":
@@ -115,6 +123,11 @@ class GaiaCatalogEntry:
             code=clean_text(value.get("code")),
             source_file=clean_text(value.get("source_file")),
             source_row=int(value.get("source_row") or 0),
+            level4=clean_text(value.get("level4")),
+            level5=clean_text(value.get("level5")),
+            item_column=max(4, min(6, int(value.get("item_column") or 4))),
+            reference_type=clean_text(value.get("reference_type")),
+            reference_text=clean_text(value.get("reference_text")),
         )
 
 
@@ -152,7 +165,7 @@ def extract_gaia_catalog(source_path: Path) -> list[GaiaCatalogEntry]:
     finally:
         workbook.close()
 
-    current = {"level1": "", "level2": "", "level3": ""}
+    current = {role: "" for role in HIERARCHY_ROLES}
     entries: list[GaiaCatalogEntry] = []
     for index, values in enumerate(rows):
         marker = clean_text(values[12])
@@ -163,14 +176,23 @@ def extract_gaia_catalog(source_path: Path) -> list[GaiaCatalogEntry]:
             if not name:
                 continue
             current[role] = name
-            if role == "level1":
-                current["level2"] = ""
-                current["level3"] = ""
-            elif role == "level2":
-                current["level3"] = ""
+            role_index = HIERARCHY_ROLES.index(role)
+            for descendant in HIERARCHY_ROLES[role_index + 1 :]:
+                current[descendant] = ""
             continue
 
-        item_name = clean_text(values[3])
+        next_values = rows[index + 1] if index + 1 < len(rows) else ()
+        next_marker = clean_text(next_values[12]) if next_values else ""
+        # A hierarchy label carries quantity 1 / unit 式 just like a leaf. Its
+        # marker is stored on the following row, so exclude it from the catalog.
+        if next_marker in HIERARCHY_MARKERS:
+            continue
+
+        named_columns = [
+            (column + 1, clean_text(values[column])) for column in range(3, 6)
+        ]
+        named_columns = [pair for pair in named_columns if pair[1]]
+        item_column, item_name = named_columns[-1] if named_columns else (4, "")
         unit = clean_text(values[9])
         quantity = values[7]
         if (
@@ -180,9 +202,23 @@ def extract_gaia_catalog(source_path: Path) -> list[GaiaCatalogEntry]:
             or not isinstance(quantity, (int, float))
         ):
             continue
-        next_values = rows[index + 1] if index + 1 < len(rows) else ()
-        specification = clean_text(next_values[3]) if next_values else ""
+        condition_parts = (
+            [clean_text(next_values[column]) for column in range(3, 6)]
+            if next_values
+            else []
+        )
+        specification = " / ".join(
+            dict.fromkeys(part for part in condition_parts if part)
+        )
         code_match = GAIA_CODE_RE.fullmatch(marker)
+        if next_marker.startswith("施工 "):
+            reference_type = "施工"
+        elif next_marker.startswith("明細 "):
+            reference_type = "明細"
+        elif "内訳書" in next_marker:
+            reference_type = "内訳"
+        else:
+            reference_type = ""
         entries.append(
             GaiaCatalogEntry(
                 level1=current["level1"],
@@ -194,6 +230,11 @@ def extract_gaia_catalog(source_path: Path) -> list[GaiaCatalogEntry]:
                 code=code_match.group(1) if code_match else "",
                 source_file=source_path.name,
                 source_row=index + 1,
+                level4=current["level4"],
+                level5=current["level5"],
+                item_column=item_column,
+                reference_type=reference_type,
+                reference_text=next_marker if reference_type else "",
             )
         )
     return entries
@@ -221,10 +262,14 @@ def write_gaia_catalog(
                 entry.level1,
                 entry.level2,
                 entry.level3,
+                entry.level4,
+                entry.level5,
                 entry.item_name,
                 entry.specification,
                 entry.unit,
                 entry.code,
+                str(entry.item_column),
+                entry.reference_type,
             )
             if key in seen:
                 continue
@@ -232,7 +277,7 @@ def write_gaia_catalog(
             entries.append(entry)
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "sources": sources,
         "entry_count": len(entries),
         "entries": [asdict(entry) for entry in entries],
@@ -253,7 +298,7 @@ def load_gaia_catalog(path: Path | None) -> list[GaiaCatalogEntry]:
     if not path.is_file():
         raise FileNotFoundError(f"GAIA取込カタログがありません: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") not in {1, 2}:
         raise ValueError("未対応のGAIA取込カタログです")
     return [
         GaiaCatalogEntry.from_dict(value)
@@ -282,8 +327,12 @@ def _score_entry(
         specification, entry.specification
     )
     level2_score = text_similarity(work_type, entry.level2)
-    level3_score = text_similarity(category, entry.level3)
-    context_score = level2_score * 0.4 + level3_score * 0.6
+    category_score = max(
+        text_similarity(category, entry.level3),
+        text_similarity(category, entry.level4),
+        text_similarity(category, entry.level5),
+    )
+    context_score = level2_score * 0.4 + category_score * 0.6
     score = (
         name_score * 0.6
         + unit_score * 0.12
@@ -373,7 +422,13 @@ def match_gaia_catalog(
     runner_up_score = scored[1].score if len(scored) > 1 else 0.0
     margin = top.score - runner_up_score
     paths = {
-        (candidate.entry.level2, candidate.entry.level3)
+        (
+            candidate.entry.level2,
+            candidate.entry.level3,
+            candidate.entry.level4,
+            candidate.entry.level5,
+            candidate.entry.item_column,
+        )
         for candidate in scored
     }
     context_present = bool(normalize_name(work_type) or normalize_name(category))

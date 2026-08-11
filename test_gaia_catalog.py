@@ -84,6 +84,46 @@ class GaiaCatalogTests(unittest.TestCase):
         self.assertEqual(entries[0].level3, "舗装打換え工")
         self.assertEqual(entries[0].code, "CB410260")
 
+    def test_extracts_deep_hierarchy_without_cataloging_group_rows(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "本工事費内訳表"
+        sheet["A4"] = "道路災害3911号"
+        sheet["M5"] = "費目行"
+        sheet["B8"] = "舗装工"
+        sheet["M9"] = "工種行"
+        sheet["C12"] = "舗装打換え工"
+        sheet["M13"] = "種別行"
+        sheet["D16"] = "橋面防水工"
+        sheet["H16"] = 1
+        sheet["J16"] = "式"
+        sheet["M17"] = "細別行"
+        sheet["E20"] = "橋面防水"
+        sheet["H20"] = 1
+        sheet["J20"] = "式"
+        sheet["M21"] = "規格行"
+        sheet["F24"] = "シート系防水"
+        sheet["H24"] = 463
+        sheet["J24"] = "m2"
+        sheet["M24"] = "[CB410260]"
+        sheet["D25"] = "新設・全面接着"
+        sheet["M25"] = "施工 第 0-189号表"
+
+        path = Path.cwd() / "test_gaia_deep_hierarchy.xlsx"
+        try:
+            workbook.save(path)
+            entries = extract_gaia_catalog(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].level4, "橋面防水工")
+        self.assertEqual(entries[0].level5, "橋面防水")
+        self.assertEqual(entries[0].item_name, "シート系防水")
+        self.assertEqual(entries[0].item_column, 6)
+        self.assertEqual(entries[0].reference_type, "施工")
+        self.assertEqual(entries[0].reference_text, "施工 第 0-189号表")
+
     def test_exact_name_unit_and_condition_can_supply_safe_code(self):
         match = match_gaia_catalog(
             [self.make_entry()],
@@ -203,6 +243,47 @@ class GaiaCatalogTests(unittest.TestCase):
         self.assertIsNone(sheet["M17"].value)
         self.assertIsNone(sheet["M18"].value)
         self.assertIsNone(sheet["M19"].value)
+
+    def test_output_preserves_deep_markers_but_omits_stale_prices_and_references(self):
+        item = self.make_item()
+        entry = GaiaCatalogEntry(
+            level1="道路災害3911号",
+            level2="舗装工",
+            level3="舗装打換え工",
+            item_name="シート系防水",
+            specification="新設・全面接着",
+            unit="m2",
+            code="CB410260",
+            source_file="accepted.xlsx",
+            source_row=1768,
+            level4="橋面防水工",
+            level5="橋面防水",
+            item_column=6,
+            reference_type="施工",
+            reference_text="施工 第 0-189号表",
+        )
+        item.item_name = "シート系防水"
+        item.specification = "新設・全面接着"
+        item.gaia_condition = item.specification
+        apply_gaia_catalog([item], [entry])
+        classify_schema_item(item)
+
+        workbook = Workbook()
+        sheet = workbook.active
+        for index, block in enumerate(build_output_blocks([item])):
+            write_block(sheet, index, block)
+
+        self.assertEqual(sheet["D16"].value, "橋面防水工")
+        self.assertEqual(sheet["M17"].value, "細別行")
+        self.assertEqual(sheet["E20"].value, "橋面防水")
+        self.assertEqual(sheet["M21"].value, "規格行")
+        self.assertEqual(sheet["F24"].value, "シート系防水")
+        self.assertEqual(sheet["D25"].value, "新設・全面接着")
+        self.assertEqual(sheet["M24"].value, "[CB410260]")
+        self.assertIsNone(sheet["M25"].value)
+        for row in (4, 8, 12, 16, 20, 24):
+            self.assertIsNone(sheet.cell(row, 11).value)
+            self.assertIsNone(sheet.cell(row, 12).value)
 
 
 if __name__ == "__main__":

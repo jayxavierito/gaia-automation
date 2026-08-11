@@ -78,6 +78,9 @@ class BoqItem:
     output_level2: str = ""
     output_level3: str = ""
     output_level4: str = ""
+    output_subcategory: str = ""
+    output_specification_group: str = ""
+    output_item_column: int = 4
     catalog_status: str = ""
     catalog_score: float = 0.0
     catalog_name_score: float = 0.0
@@ -86,6 +89,8 @@ class BoqItem:
     catalog_path_safe: bool = False
     catalog_code_safe: bool = False
     catalog_source_row: int | None = None
+    catalog_reference_type: str = ""
+    catalog_reference_text: str = ""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -250,6 +255,9 @@ def apply_gaia_catalog(
         item.output_level2 = normalize_hierarchy_label(item.work_type) or "工種未確認"
         item.output_level3 = normalize_hierarchy_label(item.category) or "種別未確認"
         item.output_level4 = clean_text(item.item_name)
+        item.output_subcategory = ""
+        item.output_specification_group = ""
+        item.output_item_column = 4
         item.gaia_item_name = item.output_level4
         item.gaia_condition = combine_unique(item.specification, item.setting)
 
@@ -272,6 +280,8 @@ def apply_gaia_catalog(
             continue
 
         item.catalog_source_row = match.entry.source_row
+        item.catalog_reference_type = match.entry.reference_type
+        item.catalog_reference_text = match.entry.reference_text
         if match.status in {"EXACT_CODE", "EXACT_PATH", "FUZZY_PATH"}:
             item.output_level4 = match.entry.item_name
             item.gaia_item_name = match.entry.item_name
@@ -279,6 +289,20 @@ def apply_gaia_catalog(
             item.output_level2 = match.entry.level2 or item.output_level2
         if match.path_safe and not clean_text(item.category):
             item.output_level3 = match.entry.level3 or item.output_level3
+        parent_path_matches = (
+            normalize_match_text(item.output_level2)
+            == normalize_match_text(match.entry.level2)
+            and normalize_match_text(item.output_level3)
+            == normalize_match_text(match.entry.level3)
+        )
+        if match.path_safe and parent_path_matches:
+            item.output_subcategory = match.entry.level4
+            item.output_specification_group = match.entry.level5
+            item.output_item_column = (
+                4
+                + bool(item.output_subcategory)
+                + bool(item.output_specification_group)
+            )
         if (
             match.code_safe
             and item.extraction_status == "READY"
@@ -428,6 +452,8 @@ def build_output_blocks(items: Iterable[BoqItem]) -> list[OutputBlock]:
     previous_section = ""
     previous_work_type = ""
     previous_category = ""
+    previous_subcategory = ""
+    previous_specification_group = ""
 
     for item in items:
         if item.match_status == "INVALID_QUANTITY":
@@ -443,13 +469,35 @@ def build_output_blocks(items: Iterable[BoqItem]) -> list[OutputBlock]:
             previous_section = section
             previous_work_type = ""
             previous_category = ""
+            previous_subcategory = ""
+            previous_specification_group = ""
         if work_type != previous_work_type:
             blocks.append(OutputBlock("work", work_type, "工種行"))
             previous_work_type = work_type
             previous_category = ""
+            previous_subcategory = ""
+            previous_specification_group = ""
         if category != previous_category:
             blocks.append(OutputBlock("category", category, "種別行"))
             previous_category = category
+            previous_subcategory = ""
+            previous_specification_group = ""
+        subcategory = clean_text(item.output_subcategory)
+        specification_group = clean_text(item.output_specification_group)
+        if subcategory and subcategory != previous_subcategory:
+            blocks.append(OutputBlock("subcategory", subcategory, "細別行"))
+            previous_subcategory = subcategory
+            previous_specification_group = ""
+        elif not subcategory:
+            previous_subcategory = ""
+            previous_specification_group = ""
+        if specification_group and specification_group != previous_specification_group:
+            blocks.append(
+                OutputBlock("specification_group", specification_group, "規格行")
+            )
+            previous_specification_group = specification_group
+        elif not specification_group:
+            previous_specification_group = ""
         blocks.append(OutputBlock("item", item_name, item=item))
     return blocks
 
@@ -473,7 +521,13 @@ def write_block(sheet: Worksheet, block_index: int, block: OutputBlock) -> None:
         write_page_header(sheet, page_index)
 
     if block.level != "item":
-        column = {"fee": 1, "work": 2, "category": 3}[block.level]
+        column = {
+            "fee": 1,
+            "work": 2,
+            "category": 3,
+            "subcategory": 4,
+            "specification_group": 5,
+        }[block.level]
         sheet.cell(row, column).value = block.value
         sheet.cell(row, 8).value = 1
         sheet.cell(row, 10).value = "式"
@@ -482,7 +536,8 @@ def write_block(sheet: Worksheet, block_index: int, block: OutputBlock) -> None:
 
     item = block.item
     assert item is not None
-    sheet.cell(row, 4).value = block.value
+    item_column = max(4, min(6, item.output_item_column))
+    sheet.cell(row, item_column).value = block.value
     sheet.cell(row, 8).value = item.quantity
     sheet.cell(row, 10).value = item.unit
     sheet.cell(row, 13).value = f"[{item.gaia_code}]" if item.gaia_code else ""
@@ -570,6 +625,9 @@ def write_review_csv(path: Path, items: list[BoqItem]) -> None:
         "output_level2",
         "output_level3",
         "output_level4",
+        "output_subcategory",
+        "output_specification_group",
+        "output_item_column",
         "catalog_status",
         "catalog_score",
         "catalog_name_score",
@@ -578,6 +636,8 @@ def write_review_csv(path: Path, items: list[BoqItem]) -> None:
         "catalog_path_safe",
         "catalog_code_safe",
         "catalog_source_row",
+        "catalog_reference_type",
+        "catalog_reference_text",
         "warnings",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
