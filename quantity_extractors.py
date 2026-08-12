@@ -851,6 +851,7 @@ def _records_from_pdf_vector_table(
             )
             if item_value:
                 current_item = item_value
+                current_category = item_value
                 current_inline_specification = inline_specification
             elif inline_specification:
                 current_inline_specification = inline_specification
@@ -868,7 +869,6 @@ def _records_from_pdf_vector_table(
                     specification, inline_specification_continuation
                 )
                 current_inline_specification = specification
-            current_category = ""
         elif schema.layout == "work_name":
             category_parts = [
                 value
@@ -1900,6 +1900,7 @@ def _pdf_header_columns(
         )
         return best_row, {
             "work_type": 0,
+            "category": 1,
             "item_name": 1,
             "specification": 2,
             "unit": 3,
@@ -1914,6 +1915,7 @@ def _pdf_header_columns(
         )
         return 0, {
             "work_type": 0,
+            "category": 1,
             "item_name": 1,
             "specification": 2,
             "unit": 3,

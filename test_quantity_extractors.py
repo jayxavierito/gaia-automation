@@ -152,6 +152,7 @@ class QuantityExtractorTests(unittest.TestCase):
             columns,
             {
                 "work_type": 0,
+                "category": 1,
                 "item_name": 1,
                 "specification": 2,
                 "unit": 3,
@@ -162,7 +163,7 @@ class QuantityExtractorTests(unittest.TestCase):
         self.assertTrue(warnings)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].work_type, "舗装工")
-        self.assertEqual(records[0].category, "")
+        self.assertEqual(records[0].category, "表層工")
         self.assertEqual(records[0].item_name, "表層工")
         self.assertEqual(
             records[0].specification, "再生密粒度アスコン(20F) / t=5cm"
@@ -178,9 +179,11 @@ class QuantityExtractorTests(unittest.TestCase):
         records = _records_from_pdf_rows(rows, header_row, columns, 3)
 
         self.assertEqual(columns["item_name"], 1)
+        self.assertEqual(columns["category"], 1)
         self.assertEqual(columns["specification"], 2)
         self.assertTrue(warnings)
         self.assertEqual(records[0].item_name, "表層工")
+        self.assertEqual(records[0].category, "表層工")
         self.assertEqual(records[0].specification, "t=5cm")
 
     def test_ocr_pdf_hierarchy_is_carried_to_continuation_page(self):
@@ -408,7 +411,10 @@ class QuantityExtractorTests(unittest.TestCase):
             [record.item_name for record in records],
             ["掘削", "床掘", "表層工", "上層路盤工"],
         )
-        self.assertTrue(all(record.category == "" for record in records))
+        self.assertEqual(
+            [record.category for record in records],
+            ["掘削", "床掘", "表層工", "上層路盤工"],
+        )
         self.assertEqual(
             records[2].specification,
             "再生密粒度アスコン(20F) / t=5cm",
