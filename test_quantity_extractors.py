@@ -9,6 +9,7 @@ import quantity_extractors
 
 from quantity_extractors import (
     _decode_repeated_ocr,
+    _correct_common_ocr_errors,
     _detect_table_grid,
     _extract_pdf_vector_tables,
     _pdf_header_columns,
@@ -22,6 +23,20 @@ from quantity_extractors import (
 
 
 class QuantityExtractorTests(unittest.TestCase):
+    def test_common_bridge_ocr_errors_are_normalized_conservatively(self):
+        self.assertEqual(_correct_common_ocr_errors("断面修復ェ"), "断面修復工")
+        self.assertEqual(_correct_common_ocr_errors("舎甫装工"), "舗装工")
+        self.assertEqual(
+            _correct_common_ocr_errors("ァンカーホ 。 ルト"), "アンカーボルト"
+        )
+        self.assertEqual(
+            _correct_common_ocr_errors("削孔 ( 中 30mm )"), "削孔 ( Φ30mm )"
+        )
+        self.assertEqual(
+            _correct_common_ocr_errors("削孔 ( 中 25m )"), "削孔 ( Φ25mm )"
+        )
+        self.assertEqual(_correct_common_ocr_errors("= 150"), "t=150")
+
     def test_generic_excel_header_table_carries_hierarchy_and_skips_total(self):
         workbook = Workbook()
         sheet = workbook.active
@@ -169,6 +184,32 @@ class QuantityExtractorTests(unittest.TestCase):
             records[0].specification, "再生密粒度アスコン(20F) / t=5cm"
         )
 
+    def test_ocr_five_column_bridge_maps_type_to_category_and_item(self):
+        rows = [
+            ["工種", "種別", "単位", "数量", "摘要"],
+            ["断面修復工", "左官工 (ポリマーセメントモルタル)", "m3", "0.03", "3箇所"],
+        ]
+
+        header_row, columns, warnings = _pdf_header_columns(rows, 5)
+        records = _records_from_pdf_rows(rows, header_row, columns, 1)
+
+        self.assertEqual(columns["category"], 1)
+        self.assertEqual(columns["item_name"], 1)
+        self.assertTrue(warnings)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].work_type, "断面修復工")
+        self.assertEqual(records[0].category, "左官工 (ポリマーセメントモルタル)")
+        self.assertEqual(records[0].item_name, "左官工 (ポリマーセメントモルタル)")
+
+    def test_ocr_headerless_five_column_bridge_continuation_keeps_first_row(self):
+        rows = [["舗装工", "密粒度アスコン(13)改質II型", "m2", "20.4", ""]]
+        header_row, columns, _ = _pdf_header_columns(rows, 5)
+        records = _records_from_pdf_rows(rows, header_row, columns, 2)
+
+        self.assertEqual(header_row, -1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].item_name, "密粒度アスコン(13)改質II型")
+
     def test_ocr_partial_six_column_header_still_uses_road_mapping(self):
         rows = [
             ["工種", "", "細目", "単位", "数量", "摘要"],
@@ -284,6 +325,39 @@ class QuantityExtractorTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, [1])
+
+    def test_ocr_five_column_summary_adds_matching_continuation_page(self):
+        class FakePage:
+            def __init__(self, text):
+                self.text = text
+
+            def extract_text(self):
+                return self.text
+
+        class FakeReader:
+            pages = [FakePage("数量総括表"), FakePage("")]
+
+            def __init__(self, _path):
+                pass
+
+        geometry = [0, 10, 20, 30, 40, 50]
+        grids = [
+            (geometry, list(range(28))),
+            (geometry, list(range(28))),
+        ]
+        with (
+            patch.object(quantity_extractors, "PdfReader", FakeReader),
+            patch.object(quantity_extractors, "_make_title_crops"),
+            patch.object(quantity_extractors, "_run_windows_ocr", return_value={}),
+            patch.object(quantity_extractors, "_detect_table_grid", side_effect=grids),
+        ):
+            selected, _, _, _ = _select_pdf_summary_pages(
+                Path("bridge.pdf"),
+                [Path("page-1.png"), Path("page-2.png")],
+                Path.cwd(),
+            )
+
+        self.assertEqual(selected, [1, 2])
 
     def test_detects_ruled_summary_table(self):
         path = Path.cwd() / "test_quantity_table.png"

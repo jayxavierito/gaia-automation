@@ -305,7 +305,7 @@ def _section_from_sheet(sheet_name: str) -> str:
 
 
 def _is_total_row(*values: str) -> bool:
-    total_labels = {"計", "小計", "合計", "総計", "合計数量"}
+    total_labels = {"計", "小計", "合計", "総計", "合計数量", "一三ロ"}
     return any(clean_text(value).replace(" ", "") in total_labels for value in values)
 
 
@@ -1329,7 +1329,7 @@ def _select_pdf_summary_pages(
             vertical, horizontal = _detect_table_grid(page_path)
         except QuantityExtractionError:
             continue
-        if 6 <= len(vertical) - 1 <= 8:
+        if 5 <= len(vertical) - 1 <= 8:
             grids[page_index] = (vertical, horizontal)
 
     strong_grid_pages = [
@@ -1736,6 +1736,22 @@ def _correct_common_ocr_errors(value: str) -> str:
     if re.fullmatch(r"シー(?:ノ)?レ(?:卞オ|本オ|材)", compact):
         return "シール材"
     replacements = {
+        "断面修復ェ": "断面修復工",
+        "舎甫装工": "舗装工",
+        "理戻し": "埋戻し",
+        "! 卞卆": "型枠",
+        "飾所": "箇所",
+        "ァンカーホ 。 ルト": "アンカーボルト",
+        "プンカーホ 。 ルト": "アンカーボルト",
+        "鋼製六角ハ 。 ネル": "鋼製六角パネル",
+        "コなズョイント": "ゴムジョイント",
+        "デムズョイント": "ゴムジョイント",
+        "耐グレーー型": "耐グレーダー型",
+        "ー廃棄物重量": "廃棄物重量",
+        "M ー 40": "M-40",
+        "30 ー 12 ー 25BB": "30-12-25BB",
+        "ミ 55 %": "≤55%",
+        "ミ55%": "≤55%",
         "揚カ": "揚力",
         "べース": "ベース",
         "rn3": "m3",
@@ -1745,6 +1761,9 @@ def _correct_common_ocr_errors(value: str) -> str:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
+    text = re.sub(r"中\s*(?=\d+\s*mm)", "Φ", text)
+    text = re.sub(r"中\s*(\d+)m\b", r"Φ\1mm", text)
+    text = re.sub(r"^\s*=\s*(\d+)", r"t=\1", text)
     return text
 
 
@@ -1883,6 +1902,26 @@ def _pdf_header_columns(
             best_row = row_index
             best_columns = columns
 
+    if column_count == 5:
+        exact_bridge_header = (
+            best_columns.get("work_type") == 0
+            and best_columns.get("category") == 1
+            and best_columns.get("unit") == 2
+            and best_columns.get("quantity") == 3
+        )
+        warnings.append(
+            "5列の橋梁数量総括表として、種別をGAIAの種別と項目名の両方に割り当てました。"
+            if exact_bridge_header
+            else "PDFの見出しOCRが不完全なため、5列橋梁数量総括表の列順を使用しました。"
+        )
+        return (best_row if best_columns else -1), {
+            "work_type": 0,
+            "category": 1,
+            "item_name": 1,
+            "unit": 2,
+            "quantity": 3,
+            "remarks": 4,
+        }, warnings
     if (
         column_count == 6
         and best_columns.get("unit") == 3
