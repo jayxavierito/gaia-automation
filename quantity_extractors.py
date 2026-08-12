@@ -586,12 +586,26 @@ def _pdf_vector_table_schema(
 
         work_type_column = roles.get("work_type")
         if "item_name" in roles:
-            layout = "work_name"
+            compact_inline_specification = (
+                specification_column is None
+                and work_type_column is not None
+                and "category" in roles
+                and roles["category"] < roles["item_name"] < unit_column
+            )
+            layout = (
+                "work_inline_specification"
+                if compact_inline_specification
+                else "work_name"
+            )
             hierarchy_start = roles.get("category", roles["item_name"])
         else:
             layout = "type"
             hierarchy_start = roles["category"]
-        hierarchy_end = specification_column or unit_column
+        hierarchy_end = (
+            specification_column
+            if specification_column is not None
+            else unit_column
+        )
         hierarchy_columns = tuple(range(hierarchy_start, hierarchy_end))
         if not hierarchy_columns:
             continue
@@ -666,7 +680,7 @@ def _is_pdf_detail_section(page_text: str) -> bool:
     for line in lines[:6]:
         compact = re.sub(r"\s+", "", line)
         if (
-            "数量計算書" in compact
+            ("数量計算書" in compact or "詳細計算" in compact or "計算明細" in compact)
             and "数量総括表" not in compact
             and "数量集計表" not in compact
         ):
@@ -701,17 +715,82 @@ def _append_pdf_note(base: str, note: str) -> str:
     return " / ".join(value for value in (clean_text(base), clean_text(note)) if value)
 
 
+def _pdf_vector_inline_specification_continuation(
+    table: list[list[object]],
+    row_index: int,
+    schema: _PdfVectorTableSchema,
+) -> str:
+    """Read specification-only rows immediately following a compact road item."""
+    parts: list[str] = []
+    for next_row in table[row_index + 1 :]:
+        work_type = (
+            _pdf_vector_cell(next_row[schema.work_type_column])
+            if schema.work_type_column is not None
+            and schema.work_type_column < len(next_row)
+            else ""
+        )
+        hierarchy = [
+            _pdf_vector_cell(next_row[column]) if column < len(next_row) else ""
+            for column in schema.hierarchy_columns
+        ]
+        unit = (
+            _pdf_vector_cell(next_row[schema.unit_column])
+            if schema.unit_column < len(next_row)
+            else ""
+        )
+        if (
+            work_type
+            or (hierarchy and hierarchy[0])
+            or unit
+            or _pdf_vector_quantity_entries(next_row, schema)
+        ):
+            break
+        continuation = " / ".join(value for value in hierarchy[1:] if value)
+        if not continuation:
+            break
+        parts.append(continuation)
+    return " / ".join(dict.fromkeys(parts))
+
+
 def _records_from_pdf_vector_table(
     table: list[list[object]],
     schema: _PdfVectorTableSchema,
     page_number: int,
     page_title: str,
     scope: str,
+    state: dict[str, Any] | None = None,
 ) -> list[QuantityRecord]:
-    current_work_type = scope if schema.layout == "type" else ""
-    current_category = ""
-    current_item = ""
-    current_type_qualifier = ""
+    shared = state if state is not None else {}
+    previous_page = shared.get("_page_number")
+    if (
+        isinstance(previous_page, int)
+        and page_number not in {previous_page, previous_page + 1}
+    ):
+        shared.clear()
+    shared["_page_number"] = page_number
+
+    shared_work_type = clean_text(shared.get("work_type", ""))
+    title_work_type = clean_text(scope) if schema.layout == "type" else ""
+    title_scope_changed = bool(
+        title_work_type and title_work_type != shared_work_type
+    )
+    current_work_type = title_work_type or shared_work_type
+    current_category = (
+        "" if title_scope_changed else clean_text(shared.get("category", ""))
+    )
+    current_item = (
+        "" if title_scope_changed else clean_text(shared.get("item_name", ""))
+    )
+    current_type_qualifier = (
+        ""
+        if title_scope_changed
+        else clean_text(shared.get("type_qualifier", ""))
+    )
+    current_inline_specification = (
+        ""
+        if title_scope_changed
+        else clean_text(shared.get("inline_specification", ""))
+    )
     active_item_position = max(0, len(schema.hierarchy_columns) - 1)
     pending_item_names: list[str] = []
     records: list[QuantityRecord] = []
@@ -752,6 +831,7 @@ def _records_from_pdf_vector_table(
             current_work_type = work_type
             current_category = ""
             current_item = ""
+            current_inline_specification = ""
             pending_item_names = []
             if schema.layout == "work_name":
                 nonempty_positions = [
@@ -763,7 +843,33 @@ def _records_from_pdf_vector_table(
         extra_specification = ""
         item_cell_multiline = False
         item_cell_split = False
-        if schema.layout == "work_name":
+        inline_specification_continuation = ""
+        if schema.layout == "work_inline_specification":
+            item_value = hierarchy[0] if hierarchy else ""
+            inline_specification = " / ".join(
+                value for value in hierarchy[1:] if value
+            )
+            if item_value:
+                current_item = item_value
+                current_inline_specification = inline_specification
+            elif inline_specification:
+                current_inline_specification = inline_specification
+            specification = _append_pdf_note(
+                inline_specification or current_inline_specification,
+                specification,
+            )
+            if quantity_entries:
+                inline_specification_continuation = (
+                    _pdf_vector_inline_specification_continuation(
+                        table, row_index, schema
+                    )
+                )
+                specification = _append_pdf_note(
+                    specification, inline_specification_continuation
+                )
+                current_inline_specification = specification
+            current_category = ""
+        elif schema.layout == "work_name":
             category_parts = [
                 value
                 for index, value in enumerate(hierarchy)
@@ -855,6 +961,10 @@ def _records_from_pdf_vector_table(
                 warnings.append(
                     "名称セルが複数行です。複数品目が結合されていないか確認してください。"
                 )
+            if inline_specification_continuation:
+                warnings.append(
+                    "細目欄の次行を規格の続きとして結合しました。"
+                )
 
             records.append(
                 QuantityRecord(
@@ -881,7 +991,31 @@ def _records_from_pdf_vector_table(
                     extraction_warnings=warnings,
                 )
             )
+    shared.update(
+        {
+            "work_type": current_work_type,
+            "category": current_category,
+            "item_name": current_item,
+            "type_qualifier": current_type_qualifier,
+            "inline_specification": current_inline_specification,
+        }
+    )
     return records
+
+
+def _pdf_vector_schema_signature(
+    table: list[list[object]], schema: _PdfVectorTableSchema
+) -> tuple[Any, ...]:
+    return (
+        schema.layout,
+        len(table[0]) if table else 0,
+        schema.work_type_column,
+        schema.hierarchy_columns,
+        schema.specification_column,
+        schema.unit_column,
+        schema.quantity_columns,
+        schema.remarks_column,
+    )
 
 
 def _extract_pdf_vector_tables(source_path: Path) -> ExtractionResult | None:
@@ -894,17 +1028,15 @@ def _extract_pdf_vector_tables(source_path: Path) -> ExtractionResult | None:
     document_warnings = [
         "このPDFは埋め込み文字を優先して抽出しました。確認用CSVを原本と照合してください。"
     ]
-    started = False
-    pages_without_table = 0
+    hierarchy_state: dict[str, Any] = {}
+    continuation_signatures: set[tuple[Any, ...]] = set()
+    last_summary_page: int | None = None
 
     try:
         with pdfplumber.open(source_path) as document:
             page_count = len(document.pages)
             for page_number, page in enumerate(document.pages, start=1):
                 page_text = page.extract_text() or ""
-                if started and _is_pdf_detail_section(page_text):
-                    break
-
                 page_tables: list[
                     tuple[list[list[object]], _PdfVectorTableSchema]
                 ] = []
@@ -913,26 +1045,44 @@ def _extract_pdf_vector_tables(source_path: Path) -> ExtractionResult | None:
                     if schema is not None:
                         page_tables.append((table, schema))
 
-                if not started:
-                    if not page_tables or not _is_pdf_summary_hint(page_text):
-                        continue
-                    started = True
-
                 if not page_tables:
-                    pages_without_table += 1
-                    if pages_without_table >= 3:
-                        break
                     continue
-                pages_without_table = 0
+
+                is_summary_anchor = _is_pdf_summary_hint(page_text)
+                is_adjacent_continuation = (
+                    last_summary_page == page_number - 1
+                    and not _is_pdf_detail_section(page_text)
+                )
+                if is_summary_anchor:
+                    accepted_tables = page_tables
+                elif is_adjacent_continuation:
+                    accepted_tables = [
+                        (table, schema)
+                        for table, schema in page_tables
+                        if _pdf_vector_schema_signature(table, schema)
+                        in continuation_signatures
+                    ]
+                else:
+                    accepted_tables = []
+                if not accepted_tables:
+                    continue
+
+                if is_summary_anchor:
+                    continuation_signatures = {
+                        _pdf_vector_schema_signature(table, schema)
+                        for table, schema in accepted_tables
+                    }
+                last_summary_page = page_number
 
                 page_title, scope = _pdf_vector_title_and_scope(page_text)
-                for table, schema in page_tables:
+                for table, schema in accepted_tables:
                     table_records = _records_from_pdf_vector_table(
                         table,
                         schema,
                         page_number,
                         page_title,
                         scope,
+                        state=hierarchy_state,
                     )
                     if not table_records:
                         continue
@@ -1128,11 +1278,16 @@ def _normalized_ocr_text(value: object) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def _select_pdf_summary_page(
+def _select_pdf_summary_pages(
     source_path: Path,
     page_paths: list[Path],
     workspace: Path,
-) -> tuple[int, list[str], dict[str, str]]:
+) -> tuple[
+    list[int],
+    list[str],
+    dict[str, str],
+    dict[int, tuple[list[int], list[int]]],
+]:
     warnings: list[str] = []
     page_text: dict[str, str] = {}
     try:
@@ -1142,10 +1297,11 @@ def _select_pdf_summary_page(
     except Exception:
         page_text = {}
 
+    hinted_pages: list[int] = []
     for page_index in range(1, len(page_paths) + 1):
         normalized = _normalized_ocr_text(page_text.get(str(page_index), ""))
-        if "数量総括表" in normalized:
-            return page_index, warnings, page_text
+        if "数量総括表" in normalized or "数量集計表" in normalized:
+            hinted_pages.append(page_index)
 
     title_directory = workspace / "title-crops"
     _make_title_crops(page_paths, title_directory)
@@ -1153,29 +1309,99 @@ def _select_pdf_summary_page(
     for page_index in range(1, len(page_paths) + 1):
         filename = f"title-{page_index:03d}.png"
         text = clean_label(title_results.get(filename, {}).get("text", ""))
-        page_text[str(page_index)] = text
+        if text:
+            page_text[str(page_index)] = text
         normalized = _normalized_ocr_text(text)
-        if "数量総括表" in normalized or (
-            "数量" in normalized and "総括" in normalized and "集計" not in normalized
-        ):
-            return page_index, warnings, page_text
+        if (
+            "数量総括表" in normalized
+            or "数量集計表" in normalized
+            or (
+                "数量" in normalized
+                and "総括" in normalized
+                and "集計" not in normalized
+            )
+        ) and page_index not in hinted_pages:
+            hinted_pages.append(page_index)
 
-    warnings.append(
-        "PDF内で「数量総括表」をOCR確認できなかったため、表罫線が最も多い"
-        "ページを候補にしました。ページ選択を確認してください。"
-    )
-    best_page = 1
-    best_score = -1
+    grids: dict[int, tuple[list[int], list[int]]] = {}
     for page_index, page_path in enumerate(page_paths, start=1):
         try:
             vertical, horizontal = _detect_table_grid(page_path)
         except QuantityExtractionError:
             continue
+        if 6 <= len(vertical) - 1 <= 8:
+            grids[page_index] = (vertical, horizontal)
+
+    strong_grid_pages = [
+        page_index
+        for page_index, (_, horizontal) in grids.items()
+        if len(horizontal) - 1 >= 18
+    ]
+    hinted_with_grid = [page for page in hinted_pages if page in grids]
+    if hinted_with_grid:
+        selected = set(hinted_with_grid)
+        # A continuation page can omit the title. Add only an adjacent,
+        # full-height table with the same column geometry as an anchored page.
+        changed = True
+        while changed:
+            changed = False
+            for page_index in strong_grid_pages:
+                if page_index in selected:
+                    continue
+                adjacent = [
+                    anchor
+                    for anchor in selected
+                    if abs(page_index - anchor) == 1
+                ]
+                if not adjacent:
+                    continue
+                if _is_pdf_detail_section(page_text.get(str(page_index), "")):
+                    continue
+                vertical = grids[page_index][0]
+                if any(grids[anchor][0] == vertical for anchor in adjacent):
+                    selected.add(page_index)
+                    changed = True
+        selected_pages = sorted(selected)
+    else:
+        selected_pages = strong_grid_pages
+
+    if selected_pages:
+        if not hinted_pages:
+            warnings.append(
+                "数量総括表の表題をOCR確認できなかったため、6～8列かつ18行以上の"
+                "罫線表を数量総括表として選択しました。"
+            )
+        if len(selected_pages) > 1:
+            warnings.append(
+                f"数量総括表の候補を{len(selected_pages)}ページ抽出しました。"
+            )
+        return selected_pages, warnings, page_text, grids
+
+    warnings.append(
+        "PDF内で数量総括表を確定できなかったため、表罫線が最も多いページを"
+        "候補にしました。ページ選択を確認してください。"
+    )
+    best_page = 1
+    best_score = -1
+    for page_index, (vertical, horizontal) in grids.items():
         score = len(vertical) * len(horizontal)
         if score > best_score:
             best_page = page_index
             best_score = score
-    return best_page, warnings, page_text
+    if best_score < 0:
+        raise QuantityExtractionError("PDF内に数量表の罫線を検出できませんでした。")
+    return [best_page], warnings, page_text, grids
+
+
+def _select_pdf_summary_page(
+    source_path: Path,
+    page_paths: list[Path],
+    workspace: Path,
+) -> tuple[int, list[str], dict[str, str]]:
+    pages, warnings, page_text, _ = _select_pdf_summary_pages(
+        source_path, page_paths, workspace
+    )
+    return pages[0], warnings, page_text
 
 
 def _group_projection_lines(values: list[int], threshold: int) -> list[int]:
@@ -1657,8 +1883,43 @@ def _pdf_header_columns(
             best_row = row_index
             best_columns = columns
 
+    if (
+        column_count == 6
+        and best_columns.get("unit") == 3
+        and best_columns.get("quantity") == 4
+    ):
+        exact_road_header = (
+            best_columns.get("work_type") == 0
+            and best_columns.get("category") == 1
+            and best_columns.get("item_name") == 2
+        )
+        warnings.append(
+            "6列の道路数量総括表として、種別を明細名、細目を規格に割り当てました。"
+            if exact_road_header
+            else "PDFの見出しOCRが不完全なため、6列道路数量総括表の列順を使用しました。"
+        )
+        return best_row, {
+            "work_type": 0,
+            "item_name": 1,
+            "specification": 2,
+            "unit": 3,
+            "quantity": 4,
+            "remarks": 5,
+        }, warnings
     if {"item_name", "unit", "quantity"}.issubset(best_columns):
         return best_row, best_columns, warnings
+    if column_count == 6:
+        warnings.append(
+            "PDFの見出しOCRが不完全なため、6列道路数量総括表の列順を使用しました。"
+        )
+        return 0, {
+            "work_type": 0,
+            "item_name": 1,
+            "specification": 2,
+            "unit": 3,
+            "quantity": 4,
+            "remarks": 5,
+        }, warnings
     if column_count == 7:
         warnings.append(
             "PDFの見出しOCRが不完全なため、珠洲市数量総括表の7列順を使用しました。"
@@ -1715,14 +1976,24 @@ def _records_from_pdf_rows(
     header_row: int,
     columns: dict[str, int],
     page_number: int,
+    state: dict[str, Any] | None = None,
 ) -> list[QuantityRecord]:
-    current = {
-        "section": "本工事費",
-        "work_type": "",
-        "category": "",
-        "item_name": "",
-        "unit": "",
-    }
+    current = state if state is not None else {}
+    previous_page = current.get("_page_number")
+    if (
+        isinstance(previous_page, int)
+        and page_number not in {previous_page, previous_page + 1}
+    ):
+        current.clear()
+    current["_page_number"] = page_number
+    for role, default in (
+        ("section", "本工事費"),
+        ("work_type", ""),
+        ("category", ""),
+        ("item_name", ""),
+        ("unit", ""),
+    ):
+        current.setdefault(role, default)
     records: list[QuantityRecord] = []
     for row_index in range(header_row + 1, len(rows)):
         row = rows[row_index]
@@ -1738,7 +2009,33 @@ def _records_from_pdf_rows(
                 "remarks",
             )
         }
-        if not any(explicit.values()):
+        quantity = _parse_ocr_quantity(_pdf_value(row, columns, "quantity"))
+        is_specification_continuation = (
+            bool(explicit["specification"])
+            and quantity is None
+            and not any(
+                explicit[role]
+                for role in (
+                    "section",
+                    "work_type",
+                    "category",
+                    "item_name",
+                    "unit",
+                    "remarks",
+                )
+            )
+            and records
+            and records[-1].source_row == row_index
+        )
+        if is_specification_continuation:
+            records[-1].specification = _append_pdf_note(
+                records[-1].specification, explicit["specification"]
+            )
+            records[-1].extraction_warnings.append(
+                "細目欄の次行を規格の続きとして結合しました。"
+            )
+            continue
+        if not any(explicit.values()) and quantity is None:
             continue
         if _is_total_row(*explicit.values()):
             continue
@@ -1757,7 +2054,6 @@ def _records_from_pdf_rows(
         if explicit["unit"]:
             current["unit"] = explicit["unit"]
 
-        quantity = _parse_ocr_quantity(_pdf_value(row, columns, "quantity"))
         item_name = explicit["item_name"] or current["item_name"]
         unit = explicit["unit"]
         if not unit and not explicit["item_name"] and (
@@ -1805,43 +2101,122 @@ def _extract_pdf_in_workspace(
 ) -> ExtractionResult:
     page_directory = workspace / "pages"
     page_paths = _render_pdf_pages(source_path, page_directory)
-    page_number, warnings, page_text = _select_pdf_summary_page(
+    selected_pages, warnings, page_text, detected_grids = _select_pdf_summary_pages(
         source_path, page_paths, workspace
     )
-    selected_page = page_paths[page_number - 1]
-    vertical, horizontal = _detect_table_grid(selected_page)
-    cell_directory = workspace / "cells"
-    _make_cell_crops(selected_page, vertical, horizontal, cell_directory)
-    cell_results = _run_windows_ocr(cell_directory)
+    cells_root = workspace / "cells"
+    rows_root = workspace / "rows"
+    cells_batch = workspace / "cells-batch"
+    rows_batch = workspace / "rows-batch"
     repeated_directory = workspace / "repeated-cells"
-    _make_repeated_cell_crops(cell_directory, cell_results, repeated_directory)
+    for directory in (
+        cells_root,
+        rows_root,
+        cells_batch,
+        rows_batch,
+        repeated_directory,
+    ):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+    page_grids: dict[int, tuple[list[int], list[int]]] = {}
+    page_row_transforms: dict[int, dict[str, dict[str, float]]] = {}
+    for page_number in selected_pages:
+        page_path = page_paths[page_number - 1]
+        vertical, horizontal = detected_grids.get(page_number) or _detect_table_grid(
+            page_path
+        )
+        page_grids[page_number] = (vertical, horizontal)
+
+        cell_directory = cells_root / f"page-{page_number:03d}"
+        _make_cell_crops(page_path, vertical, horizontal, cell_directory)
+        for source in cell_directory.glob("*.png"):
+            shutil.copyfile(
+                source, cells_batch / f"p{page_number:03d}_{source.name}"
+            )
+
+        row_directory = rows_root / f"page-{page_number:03d}"
+        page_row_transforms[page_number] = _make_row_crops(
+            page_path, vertical, horizontal, row_directory
+        )
+        for source in row_directory.glob("*.png"):
+            shutil.copyfile(
+                source, rows_batch / f"p{page_number:03d}_{source.name}"
+            )
+
+    cell_results = _run_windows_ocr(cells_batch)
+    _make_repeated_cell_crops(cells_batch, cell_results, repeated_directory)
     if any(repeated_directory.glob("*.png")):
         repeated_results = _run_windows_ocr(repeated_directory)
         _merge_repeated_ocr(cell_results, repeated_results)
-        repeated_english_results = _run_windows_ocr(
-            repeated_directory, language="en-US"
-        )
-        _merge_repeated_ocr(cell_results, repeated_english_results)
-    rows = _ocr_matrix(
-        cell_results,
-        row_count=len(horizontal) - 1,
-        column_count=len(vertical) - 1,
-    )
-    row_directory = workspace / "rows"
-    row_transforms = _make_row_crops(
-        selected_page, vertical, horizontal, row_directory
-    )
-    row_results = _run_windows_ocr(row_directory)
-    _merge_row_ocr(rows, row_results, row_transforms, vertical)
-    header_row, columns, header_warnings = _pdf_header_columns(
-        rows, len(vertical) - 1
-    )
-    warnings.extend(header_warnings)
+        try:
+            repeated_english_results = _run_windows_ocr(
+                repeated_directory, language="en-US"
+            )
+        except QuantityExtractionError:
+            warnings.append(
+                "英語OCR言語が利用できないため、単文字の英語OCR再試行を省略しました。"
+            )
+        else:
+            _merge_repeated_ocr(cell_results, repeated_english_results)
+    row_results = _run_windows_ocr(rows_batch)
+
+    records: list[QuantityRecord] = []
+    state: dict[str, Any] = {}
     recovered_units = 0
-    if "unit" in columns:
-        recovered_units = _fill_missing_unit_glyphs(
-            rows, columns["unit"], header_row, cell_directory
+    page_metadata: list[dict[str, Any]] = []
+    for page_number in selected_pages:
+        prefix = f"p{page_number:03d}_"
+        vertical, horizontal = page_grids[page_number]
+        page_cell_results = {
+            filename.removeprefix(prefix): result
+            for filename, result in cell_results.items()
+            if filename.startswith(prefix)
+        }
+        rows = _ocr_matrix(
+            page_cell_results,
+            row_count=len(horizontal) - 1,
+            column_count=len(vertical) - 1,
         )
+        page_row_results = {
+            filename.removeprefix(prefix): result
+            for filename, result in row_results.items()
+            if filename.startswith(prefix)
+        }
+        _merge_row_ocr(
+            rows,
+            page_row_results,
+            page_row_transforms[page_number],
+            vertical,
+        )
+        header_row, columns, header_warnings = _pdf_header_columns(
+            rows, len(vertical) - 1
+        )
+        for warning in header_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+        cell_directory = cells_root / f"page-{page_number:03d}"
+        if "unit" in columns:
+            recovered_units += _fill_missing_unit_glyphs(
+                rows, columns["unit"], header_row, cell_directory
+            )
+        page_records = _records_from_pdf_rows(
+            rows, header_row, columns, page_number, state=state
+        )
+        records.extend(page_records)
+        page_metadata.append(
+            {
+                "page": page_number,
+                "columns": len(vertical) - 1,
+                "rows": len(horizontal) - 1,
+                "vertical_lines": vertical,
+                "horizontal_lines": horizontal,
+                "header_columns": columns,
+                "record_count": len(page_records),
+            }
+        )
+
     if recovered_units:
         warnings.append(
             f"単文字単位を画像字形で{recovered_units}件補完しました。該当単位を確認してください。"
@@ -1849,23 +2224,26 @@ def _extract_pdf_in_workspace(
     warnings.append(
         "PDFは画像OCRで抽出しました。GAIA出力前にnormalized.csvを原本と照合してください。"
     )
-    records = _records_from_pdf_rows(rows, header_row, columns, page_number)
     if not records:
         raise QuantityExtractionError(
-            f"PDF p.{page_number}の表から数量明細を抽出できませんでした。"
+            "選択したPDF表から数量明細を抽出できませんでした。"
         )
 
+    first_page = selected_pages[0]
+    first_vertical, first_horizontal = page_grids[first_page]
     metadata: dict[str, Any] = {
-        "selected_page": page_number,
+        "selected_page": first_page,
+        "selected_pages": selected_pages,
         "page_count": len(page_paths),
         "grid": {
-            "columns": len(vertical) - 1,
-            "rows": len(horizontal) - 1,
-            "vertical_lines": vertical,
-            "horizontal_lines": horizontal,
+            "columns": len(first_vertical) - 1,
+            "rows": len(first_horizontal) - 1,
+            "vertical_lines": first_vertical,
+            "horizontal_lines": first_horizontal,
         },
+        "page_grids": page_metadata,
         "page_title_ocr": page_text,
-        "header_columns": columns,
+        "header_columns": page_metadata[0]["header_columns"],
     }
     if preserve_workspace:
         metadata["ocr_workspace"] = str(workspace.resolve())
